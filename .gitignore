@@ -1,0 +1,27 @@
+# ===== 密钥（切勿提交）=====
+.env
+.env.*
+!.env.example
+
+# ===== 依赖与构建产物（引擎/插件不入库）=====
+node_modules/
+.dist/
+out/
+
+# ===== 本地数据（每台机器独立）=====
+.dsh/
+data/
+dsh-home/
+.workbuddy/
+
+# ===== 本仓库不需要的 npm 脚手架残留（引擎由 DSH Desktop 提供）=====
+package.json
+package-lock.json
+
+# ===== 系统 / IDE =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== 日志 =====
+*.log
