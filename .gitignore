@@ -23,5 +23,9 @@ package-lock.json
 Thumbs.db
 desktop.ini
 
+# ===== 本地部署笔记（含本机细节，不公开）=====
+本地部署笔记.md
+LOCAL_NOTES.md
+
 # ===== 日志 =====
 *.log
