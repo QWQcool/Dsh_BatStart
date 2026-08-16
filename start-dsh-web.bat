@@ -48,6 +48,12 @@ if not exist "%DSH_BIN%" (
   goto :eof
 )
 
+:: 4.5) 部署 dsh-extra（伴侣插件 + 扩展预设 + oh-we-need 全局提示词，幂等）
+if exist "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs" (
+  echo [Dsh_BatStart] 部署伴侣插件 / 预设 / 全局提示词 ...
+  "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs"
+)
+
 :: 5) 启动本地服务器（独立窗口，关闭该窗口即停止服务）
 echo [Dsh_BatStart] 正在启动 DSH 网页版（端口 %PORT%）...
 start "DSH Web" cmd /k "%NODE_EXE% \"%DSH_BIN%\" web --port %PORT%"
