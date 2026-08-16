@@ -17,7 +17,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const cp = require("child_process");
-const yaml = require("js-yaml");
 
 const HERE = __dirname;                       // <repo>/dsh-extra
 const REPO = path.dirname(HERE);              // <repo>
@@ -28,6 +27,9 @@ const PLUGIN_DST = path.join(PROFILE_WEB, "node_modules");
 const PRESET_DST = path.join(ENGINE_DIR, "config", "agent-presets");
 const PATCH_FILE = path.join(PROFILE_WEB, "cordis.patch.yml");
 const SETTINGS_FILE = path.join(DSH_HOME, "settings.yaml");
+
+// 自包含：从 dsh-extra/lib 加载 js-yaml（不依赖仓库 node_modules 是否已安装）
+const yaml = require(path.join(HERE, "lib", "js-yaml"));
 
 // oh-we-need：DeepSeek V4 思维链引导（we need to 句式），注入为部署级全局 persona
 const OH_WE_NEED_PERSONA = `You are a helpful software engineer assistant. We need to follow this style for all internal reasoning (chain-of-thought):
