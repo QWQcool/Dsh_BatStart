@@ -1,4 +1,5 @@
-﻿﻿﻿@echo off
+@echo off
+chcp 65001 >nul
 setlocal EnableDelayedExpansion
 :: ============================================================
 :: Dsh_BatStart — 一键启动 DeepSeek Harness 网页版（自包含，不依赖 DSH Desktop）
