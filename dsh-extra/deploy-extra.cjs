@@ -136,6 +136,10 @@ function deployPersona() {
   fs.writeFileSync(PATCH_FILE, head + yaml.dump(patch, { lineWidth: -1 }), "utf8");
 }
 
+// 2026-08-18 停用（main 已不再调用）：zat-dsh-engine 的 package.json 声明了
+// dsh.bundle.patch（./cordis.patch.yml），引擎启动时会自动把它作为 bundle 层应用
+// （include plugin-market）。若再把同一 patch 合并进 web profile，会触发
+// duplicate loader entry id: plugin-market，导致 dsh web 启动失败、端口无监听。
 function deployPluginPatches() {
   // 离线伴侣插件往往自带 cordis.patch.yml（用于向 Loader 注册自己），
   // 但 deployPlugins() 只复制目录，不会把插件级 patch 合并进 web profile。
@@ -203,7 +207,6 @@ function main() {
   deployPresets();
   deployPlugins();
   deployPersona();
-  deployPluginPatches();
   deploySettings();
   log("部署完成 ✓");
 }

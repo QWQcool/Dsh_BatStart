@@ -1,65 +1,113 @@
 @echo off
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
-:: ============================================================
-:: Dsh_BatStart — 一键启动 DeepSeek Harness 网页版（自包含，不依赖 DSH Desktop）
-:: 双击即：启动本地服务器 + 在浏览器打开 http://127.0.0.1:3090
-:: ============================================================
 set "PORT=3090"
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 set "DSH_BIN=%SCRIPT_DIR%\node_modules\@deepseek-ai\dsh\lib\bin.js"
 
-:: 1) 端口健康检查：已在运行则只开浏览器，不重复启动
+:: 1) port health check: if running and responding, just open browser;
+::    if occupied but dead, kill the stale process and continue to start
 set "RUNNING="
 for /f "tokens=*" %%a in ('netstat -ano 2^>nul ^| findstr ":3090"') do set "RUNNING=1"
 if defined RUNNING (
-  echo [Dsh_BatStart] 检测到 %PORT% 已在运行，直接打开浏览器...
-  start "" http://127.0.0.1:%PORT%
-  goto :eof
+  curl -s -m 2 http://127.0.0.1:%PORT%/ >nul 2>&1
+  if not errorlevel 1 (
+    echo [Dsh_BatStart] port %PORT% already running and responding, open browser
+    start "" "http://127.0.0.1:%PORT%"
+    echo Press any key to close this window. The service keeps running.
+    pause >nul
+    goto :eof
+  )
+  echo [Dsh_BatStart] port %PORT% is occupied but NOT responding. Removing stale process.
+  for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":3090" ^| findstr "LISTENING"') do (
+    taskkill /F /PID %%p >nul 2>&1
+  )
+  ping -n 3 127.0.0.1 >nul
 )
 
-:: 2) Node 运行时（优先 PATH 中的 node）
+:: 2) locate node and resolve to full path of node.exe
 set "NODE_EXE="
-where node >nul 2>&1 && set "NODE_EXE=node"
+for /f "tokens=*" %%x in ('where node 2^>nul') do (
+  if not defined NODE_EXE set "NODE_EXE=%%x"
+)
 if not defined NODE_EXE (
-  echo [错误] 未找到 node。请先安装 Node.js (https://nodejs.org) 并确保其在 PATH 中。
+  for /d %%d in ("%USERPROFILE%\.workbuddy\binaries\node\versions\*") do (
+    if exist "%%d\node.exe" set "NODE_EXE=%%d\node.exe"
+  )
+)
+if not defined NODE_EXE (
+  for /d %%d in ("%LOCALAPPDATA%\Programs\*") do (
+    if exist "%%d\node.exe" set "NODE_EXE=%%d\node.exe"
+  )
+)
+if not defined NODE_EXE (
+  if exist "%ProgramFiles%\nodejs\node.exe" set "NODE_EXE=%ProgramFiles%\nodejs\node.exe"
+)
+if not defined NODE_EXE (
+  echo [ERROR] node not found. Install Node.js or place node.exe at:
+  echo   %USERPROFILE%\.workbuddy\binaries\node\versions\YOURVER\node.exe
+  echo   %ProgramFiles%\nodejs\node.exe
   pause
   goto :eof
 )
+echo [Dsh_BatStart] Using Node: %NODE_EXE%
 
-:: 3) 读取同目录 .env（若存在）注入环境变量（含 API Key）
+:: 3) load .env (API keys etc.) if present
 if exist "%SCRIPT_DIR%\.env" (
-  echo [Dsh_BatStart] 读取 .env ...
+  echo [Dsh_BatStart] loading .env
   for /f "usebackq tokens=1,* delims==" %%a in ("%SCRIPT_DIR%\.env") do (
     if not "%%a"=="" if not "%%a:~0,1"=="#" set "%%a=%%b"
   )
 )
 
-:: 4) 引擎缺失则自动安装（仅首次，需联网；用国内镜像加速）
+:: 4) install engine if missing (first run, needs network; npmmirror)
 if not exist "%DSH_BIN%" (
-  echo [Dsh_BatStart] 未找到本地 dsh 引擎，正在自动安装 @deepseek-ai/dsh ...
+  echo [Dsh_BatStart] dsh engine not found, installing @deepseek-ai/dsh
   pushd "%SCRIPT_DIR%"
+  "%NODE_EXE%" -v >nul 2>&1
   npm install @deepseek-ai/dsh --registry=https://registry.npmmirror.com 2>&1
   popd
 )
 if not exist "%DSH_BIN%" (
-  echo [错误] 引擎安装失败。请检查网络，或手动执行：npm install @deepseek-ai/dsh
+  echo [ERROR] engine install failed. Check network or run: npm install @deepseek-ai/dsh
   pause
   goto :eof
 )
 
-:: 4.5) 部署 dsh-extra（伴侣插件 + 扩展预设 + oh-we-need 全局提示词，幂等）
+:: 4.5) deploy dsh-extra (companion plugins / presets / oh-we-need global prompt, idempotent)
 if exist "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs" (
-  echo [Dsh_BatStart] 部署伴侣插件 / 预设 / 全局提示词 ...
+  echo [Dsh_BatStart] deploying companion plugins / presets / global prompt
   "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs"
 )
 
-:: 5) 启动本地服务器（独立窗口，关闭该窗口即停止服务）
-echo [Dsh_BatStart] 正在启动 DSH 网页版（端口 %PORT%）...
-start "DSH Web" cmd /k "%NODE_EXE% \"%DSH_BIN%\" web --port %PORT%"
+:: 5) start server in a new window; its output is logged to dsh-server.log
+echo [Dsh_BatStart] starting DSH web on port %PORT%
+set "SERVER_LOG=%SCRIPT_DIR%\dsh-server.log"
+if exist "%SERVER_LOG%" del "%SERVER_LOG%"
+start "DSH Web" cmd /c ""%NODE_EXE%" "%DSH_BIN%" web --port %PORT% > "%SERVER_LOG%" 2>&1"
 
-:: 6) 稍候并打开浏览器
-timeout /t 4 >nul
-start "" http://127.0.0.1:%PORT%
+:: 6) wait, then self-check the port and open browser
+echo [Dsh_BatStart] waiting for server to start
+ping -n 7 127.0.0.1 >nul
+set "UP="
+netstat -ano 2>nul | findstr ":3090" >nul && set "UP=1"
+if not defined UP (
+  ping -n 4 127.0.0.1 >nul
+  netstat -ano 2>nul | findstr ":3090" >nul && set "UP=1"
+)
+start "" "http://127.0.0.1:%PORT%"
+echo.
+echo [Dsh_BatStart] ============================================
+if defined UP (
+  echo  Service is UP and listening on port %PORT%. Browser opened.
+) else (
+  echo  WARNING: port %PORT% is NOT listening yet.
+  echo  The server window may have failed to start.
+  echo  Check dsh-server.log in this folder and send its content for help.
+)
+echo  The server window title is DSH Web. Close it to stop the service.
+echo [Dsh_BatStart] ============================================
+echo Press any key to close this window. The server window keeps running.
+pause >nul
 goto :eof
