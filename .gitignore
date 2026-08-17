@@ -17,6 +17,8 @@ dsh-home/
 # ===== 本仓库不需要的 npm 脚手架残留（引擎由 DSH Desktop 提供）=====
 package.json
 package-lock.json
+# 例外：离线伴侣插件需要 package.json 才能被 DSH Loader / client-modules 识别
+!dsh-extra/plugins/**/package.json
 
 # ===== 系统 / IDE =====
 .DS_Store

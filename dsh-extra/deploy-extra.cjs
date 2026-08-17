@@ -136,6 +136,52 @@ function deployPersona() {
   fs.writeFileSync(PATCH_FILE, head + yaml.dump(patch, { lineWidth: -1 }), "utf8");
 }
 
+function deployPluginPatches() {
+  // 离线伴侣插件往往自带 cordis.patch.yml（用于向 Loader 注册自己），
+  // 但 deployPlugins() 只复制目录，不会把插件级 patch 合并进 web profile。
+  // 这里以插件市场 zat-dsh-engine 为例做幂等合并；其它插件如需自动启用可类推。
+  const pluginPatchFiles = [
+    { plugin: "zat-dsh-engine", file: path.join(HERE, "plugins", "zat-dsh-engine", "cordis.patch.yml") }
+  ];
+  if (!fs.existsSync(PATCH_FILE)) return;
+  let patch = [];
+  try { patch = yaml.load(fs.readFileSync(PATCH_FILE, "utf8")) || []; }
+  catch (e) { warn("解析 cordis.patch.yml 失败，跳过插件 patch 合并: " + e.message); return; }
+  patch = patch || [];
+  let changed = false;
+  for (const { plugin, file } of pluginPatchFiles) {
+    if (!fs.existsSync(file)) continue;
+    let pp = [];
+    try { pp = yaml.load(fs.readFileSync(file, "utf8")) || []; }
+    catch (e) { warn(`解析 ${plugin} 的 cordis.patch.yml 失败，跳过: ${e.message}`); continue; }
+    for (const item of pp) {
+      if (!item) continue;
+      if (item.insert && Array.isArray(item.insert)) {
+        let targetInsert = patch.find((p) => p && p.insert && Array.isArray(p.insert));
+        if (!targetInsert) {
+          targetInsert = { insert: [] };
+          patch.push(targetInsert);
+        }
+        for (const row of item.insert) {
+          if (row && row.id && !targetInsert.insert.some((r) => r && r.id === row.id)) {
+            targetInsert.insert.push(row);
+            log(`${plugin} 的 insert(${row.id}) 已合并到 web profile`);
+            changed = true;
+          }
+        }
+      } else if (item.id && !patch.some((p) => p && p.id === item.id)) {
+        patch.push(item);
+        log(`${plugin} 的 patch 条目(${item.id}) 已合并到 web profile`);
+        changed = true;
+      }
+    }
+  }
+  if (changed) {
+    const head = `# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; \`!!js\` expressions allowed).\n`;
+    fs.writeFileSync(PATCH_FILE, head + yaml.dump(patch, { lineWidth: -1 }), "utf8");
+  }
+}
+
 function deploySettings() {
   fs.mkdirSync(DSH_HOME, { recursive: true });
   let cfg = {};
@@ -157,6 +203,7 @@ function main() {
   deployPresets();
   deployPlugins();
   deployPersona();
+  deployPluginPatches();
   deploySettings();
   log("部署完成 ✓");
 }
