@@ -6,20 +6,18 @@ set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 set "DSH_BIN=%SCRIPT_DIR%\node_modules\@deepseek-ai\dsh\lib\bin.js"
 
-:: 1) port health check: if running and responding, just open browser;
-::    if occupied but dead, kill the stale process and continue to start
+:: 1) port check: if 3090 is occupied, kill the existing process and restart
+::    with the latest config. This prevents stale services from serving
+::    deleted plugins (e.g. harness-pet) after a config change.
 set "RUNNING="
 for /f "tokens=*" %%a in ('netstat -ano 2^>nul ^| findstr ":3090"') do set "RUNNING=1"
 if defined RUNNING (
   curl -s -m 2 http://127.0.0.1:%PORT%/ >nul 2>&1
   if not errorlevel 1 (
-    echo [Dsh_BatStart] port %PORT% already running and responding, open browser
-    start "" "http://127.0.0.1:%PORT%"
-    echo Press any key to close this window. The service keeps running.
-    pause >nul
-    goto :eof
+    echo [Dsh_BatStart] port %PORT% has an existing service. Restarting to load the latest config.
+  ) else (
+    echo [Dsh_BatStart] port %PORT% is occupied but NOT responding. Removing stale process.
   )
-  echo [Dsh_BatStart] port %PORT% is occupied but NOT responding. Removing stale process.
   for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":3090" ^| findstr "LISTENING"') do (
     taskkill /F /PID %%p >nul 2>&1
   )

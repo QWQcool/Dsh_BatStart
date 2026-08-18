@@ -26,7 +26,7 @@ const NS = settingsNamespace("dsh-third-party-thinking");
 const Config = z.object({
 	// 默认关闭：百炼等严格校验请求体的第三方 API 会直接拒绝
 	// reasoning_effort，只有确认 provider 支持时才应开启。
-	enabled: z.boolean().default(false),
+	enabled: z.boolean().default(true),
 	// 留空表示「只显示档位控件，不注入任何请求字段」。
 	wireField: z.string().default("reasoning_effort")
 });

@@ -22,7 +22,7 @@ const inject = ["settings", "systemPrompt", "webServer"];
 
 const NS = settingsNamespace("dsh-prompt");
 const Config = z.object({
-	enabled: z.boolean().default(false),
+	enabled: z.boolean().default(true),
 	mode: z.union([z.const("replace"), z.const("append")]).default("append"),
 	text: z.string().default("")
 });
