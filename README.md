@@ -28,7 +28,6 @@
 | 目录/文件 | 内容 | 部署到哪 |
 |---|---|---|
 | `dsh-extra/plugins/` | 插件市场、识图、文件改动追踪、余额、侧边栏增强等 | `~/.dsh/profiles/web/node_modules/` |
-| **`dsh-trivium`** | 自制的跨会话记忆。昨天说的「鉴权走 header X」，关掉窗口再开还能找回来。插件在 [QWQcool/dsh-trivium](https://github.com/QWQcool/dsh-trivium)，启动时从 npm 装 | 本机 DSH 的 web profile |
 | `dsh-extra/presets/` | 8 个扩展预设（含 Windows 极简 `minimal-win`、`router-standard` 等） | 引擎 `config/agent-presets/` |
 | `dsh-extra/deploy-extra.cjs` | 部署脚本，跑过的会跳过 | — |
 | **全局提示词** | **oh-we-need**（DeepSeek V4 思维链引导，`we need to ...` 句式）写入 web profile 的 `system-prompt.persona` | 每次会话全局生效 |
@@ -55,11 +54,15 @@
 
 默认用 `minimal-win`（Windows 极简：持久 bash + PowerShell 工具）。Web UI 可切换 `standard` / `code` / `minimal` / `minimal-win` / `router-standard` 等共 12 个（4 个官方 + 8 个来自 `dsh-extra/presets`）。
 
+## 自带：跨会话记忆
+
+启动时会装上自制插件 [dsh-trivium](https://github.com/QWQcool/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」。
+
+识图、侧边栏那些是可选的；记忆插件不是。
+
 ## 可选插件
 
 `dsh-extra/plugins` 部署后，设置里可按需打开：插件市场、识图（`view_image`，默认智谱 `glm-4.6v-flash`）、文件改动追踪、余额、侧边栏增强。
-
-跨会话记忆会随启动一起装上，不用再点一次。每个工作区一个 `.dsh/trivium.tdb`。插件本身在 [QWQcool/dsh-trivium](https://github.com/QWQcool/dsh-trivium)。
 
 ## 故障排查
 
