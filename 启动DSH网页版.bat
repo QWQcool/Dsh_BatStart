@@ -73,9 +73,9 @@ if not exist "%DSH_BIN%" (
   goto :eof
 )
 
-:: 4.5) deploy dsh-extra (companion plugins / presets / oh-we-need global prompt, idempotent)
+:: 4.5) deploy dsh-extra (companion plugins / presets / oh-we-need / dsh-trivium, idempotent)
 if exist "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs" (
-  echo [Dsh_BatStart] deploying companion plugins / presets / global prompt
+  echo [Dsh_BatStart] deploying companion plugins / presets / global prompt / dsh-trivium
   "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs"
 )
 

@@ -16,23 +16,24 @@
    - `DEEPSEEK_API_KEY=sk-xxxx`（必填）
    - `ZHIPUAI_API_KEY=你的智谱Key`（选填，开启识图）
 2. 双击 `启动DSH网页版.bat`（或同名 ASCII 备用 `start-dsh-web.bat`）。
-3. 脚本依次：检查引擎（缺失则自动安装）→ **部署 `dsh-extra`（伴侣插件 + 扩展预设 + 全局提示词，幂等）** → 启动本地服务器（独立窗口，端口 **3090**）→ 约 4 秒后自动打开 `http://127.0.0.1:3090`。
+3. 脚本依次：检查引擎（缺失则自动安装）→ **部署 `dsh-extra`（伴侣插件 + 扩展预设 + 全局提示词 + 自制记忆插件 `dsh-trivium`，幂等）** → 启动本地服务器（独立窗口，端口 **3090**）→ 约 4 秒后自动打开 `http://127.0.0.1:3090`。
 4. 端口已占用则只开浏览器，不重复启动。关闭命令行窗口即停止服务。
 
 > 新机器（git clone 后）首次双击会联网安装引擎；安装与部署均为幂等，可反复运行。
 
 ## dsh-extra：离线插件 / 预设 / 全局提示词
 
-`dsh-extra/` 把"桌面版多出来的东西"全部离线打包进仓库，`.bat` 首次运行自动部署到本机 `~/.dsh`：
+`dsh-extra/` 把"桌面版多出来的东西"全部离线打包进仓库，`.bat` 首次运行自动部署到本机 `~/.dsh`。自制记忆插件 **不内嵌源码**，从 npm 安装：
 
 | 目录/文件 | 内容 | 部署目标 |
 |---|---|---|
 | `dsh-extra/plugins/` | 伴侣插件：插件市场 `zat-dsh-engine`、识图 `dsh-vision`、文件改动追踪、balance、better-sidebar 等 | `~/.dsh/profiles/web/node_modules/` |
+| **`dsh-trivium`（自制）** | 进程内图记忆内核：会话 A 记下「鉴权走 header X」，会话 B 用 `ctx_find("鉴权")` 命中。默认 `autoRecall` 关，启动只注入短地图。npm [`dsh-trivium@0.3.0`](https://www.npmjs.com/package/dsh-trivium) · [QWQcool/dsh-trivium](https://github.com/QWQcool/dsh-trivium) | `~/.dsh/profiles/web/node_modules/dsh-trivium`（本机若桌面已有源码仓库则 junction；**不**拷进 `dsh-extra/plugins/`） |
 | `dsh-extra/presets/` | 8 个扩展预设（含 Windows 极简 `minimal-win`、`router-standard` 等） | 引擎 `config/agent-presets/` |
 | `dsh-extra/deploy-extra.cjs` | 部署脚本（幂等：已存在跳过，可重复运行） | — |
 | **全局提示词** | **oh-we-need**（DeepSeek V4 思维链引导，`we need to ...` 句式）自动写入 `~/.dsh/profiles/web/cordis.patch.yml` 的 `system-prompt.persona` | 每次会话全局生效 |
 
-所以：**clone 后双击 `.bat` = 完整版**（与 DSH Desktop 体验一致），不需要另外装 DSH Desktop。插件按需在 Web UI 的 `设置` 中启用；识图默认指向智谱免费模型，填 Key 即可。
+所以：**clone 后双击 `.bat` = 完整版**（与 DSH Desktop 体验一致），不需要另外装 DSH Desktop，也不需要再手动 `dsh plugin add`。插件按需在 Web UI 的 `设置` 中启用；识图默认指向智谱免费模型，填 Key 即可。设置页会出现「Trivium 记忆」。
 
 ### oh-we-need 全局提示词
 
@@ -48,7 +49,7 @@
 
     node "<仓库>\node_modules\@deepseek-ai\dsh\lib\bin.js" web --port 3090
 
-引擎 / 插件 / 预设都在仓库内（引擎在 `node_modules`，插件与预设离线打包在 `dsh-extra`），因此本仓库即可用、可公开、可审计。
+引擎在本仓库 `node_modules`，伴侣插件与预设离线打包在 `dsh-extra`，自制记忆插件 `dsh-trivium` 从 npm 装进 `~/.dsh/profiles/web`（不把源码拷进本仓库）。因此 clone 后双击即可用、可公开、可审计。
 
 ## 预设
 
@@ -57,6 +58,8 @@
 ## 可选插件
 
 `dsh-extra/plugins` 部署后，Web UI `设置` 中可按需启用：插件市场、识图（`view_image`，默认智谱 `glm-4.6v-flash`）、文件改动追踪与还原、余额显示、侧边栏增强等。
+
+**`dsh-trivium` 会自动挂上**（不是可选开关）：每个工作区一个 `<workspace>/.dsh/trivium.tdb`，四个工具 `ctx_find` / `ctx_read` / `ctx_remember` / `ctx_link`。源码在独立仓库 [QWQcool/dsh-trivium](https://github.com/QWQcool/dsh-trivium)，本启动器只负责安装并写入 Loader insert。不要把插件源码拷进本仓库。
 
 ## 故障排查
 
