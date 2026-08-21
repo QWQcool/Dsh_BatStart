@@ -7,7 +7,7 @@
  *   它把仓库 dsh-extra/ 里离线打包的内容部署到本机，并挂上自制记忆插件：
  *     1) presets/  -> <引擎>/config/agent-presets/（8 个扩展预设，含 minimal-win）
  *     2) plugins/  -> ~/.dsh/profiles/web/node_modules/（伴侣插件：插件市场/识图/文件改动追踪等）
- *     3) dsh-trivium@0.4.1 -> ~/.dsh/profiles/web/node_modules/（npm 安装；本机若有 Desktop/dsh-trivium 源码则 junction，不把源码拷进本仓库）
+ *     3) dsh-trivium@0.4.2 -> ~/.dsh/profiles/web/node_modules/（npm 安装；本机若有 Desktop/dsh-trivium 源码则 junction，不把源码拷进本仓库）
  *     4) persona   -> 注入 ~/.dsh/profiles/web/cordis.patch.yml（oh-we-need 全局系统提示词）
  *     5) settings  -> 确保 ~/.dsh/settings.yaml 默认预设为 minimal-win
  * 全部幂等：已存在的内容跳过，可反复运行。
@@ -29,7 +29,7 @@ const PRESET_DST = path.join(ENGINE_DIR, "config", "agent-presets");
 const PATCH_FILE = path.join(PROFILE_WEB, "cordis.patch.yml");
 const SETTINGS_FILE = path.join(DSH_HOME, "settings.yaml");
 const TRIVIUM_PKG = "dsh-trivium";
-const TRIVIUM_VERSION = "0.4.1";
+const TRIVIUM_VERSION = "0.4.2";
 const PATCH_HEAD = `# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; \`!!js\` expressions allowed).\n`;
 
 // 自包含：从 dsh-extra/lib 加载 js-yaml（不依赖仓库 node_modules 是否已安装）
