@@ -12,8 +12,19 @@ window.__ModuleLoader__.load({
 
 		const react = require("react");
 		const { jsx, jsxs } = require("react/jsx-runtime");
-		const { bindSnapshotSelector } = require("@deepseek-ai/dsh-client-web-react");
 		const { Button } = require("@deepseek-ai/dsh-client-ui-primitives");
+
+		// 0.1.1 起不再提供 @deepseek-ai/dsh-client-web-react；用 settingsScope 自己的订阅面。
+		function bindSnapshotSelector(store) {
+			return function useScope(selector) {
+				const snap = react.useSyncExternalStore(
+					(onStoreChange) => store.subscribe(onStoreChange),
+					() => store.getSnapshot(),
+					() => store.getSnapshot()
+				);
+				return selector(snap);
+			};
+		}
 
 		const NS = "dsh-third-party-thinking";
 

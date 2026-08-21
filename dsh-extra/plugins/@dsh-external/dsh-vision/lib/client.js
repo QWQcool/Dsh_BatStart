@@ -10,8 +10,19 @@ window.__ModuleLoader__.load({
 
     const react = require("react");
     const { jsx, jsxs } = require("react/jsx-runtime");
-    const { bindSnapshotSelector } = require("@deepseek-ai/dsh-client-web-react");
     const { Button } = require("@deepseek-ai/dsh-client-ui-primitives");
+
+    // 0.1.1 起不再提供 @deepseek-ai/dsh-client-web-react；用 settingsScope 自己的订阅面。
+    function bindSnapshotSelector(store) {
+      return function useScope(selector) {
+        const snap = react.useSyncExternalStore(
+          (onStoreChange) => store.subscribe(onStoreChange),
+          () => store.getSnapshot(),
+          () => store.getSnapshot()
+        );
+        return selector(snap);
+      };
+    }
 
     const NS = "dsh-vision";
     const DEFAULTS = {
@@ -23,8 +34,8 @@ window.__ModuleLoader__.load({
     };
 
     const L = {
-      nav: "识图插件（view_image）",
-      navSub: "为纯文本模型提供识图能力。填写任意 OpenAI 兼容 VLM 端点的地址与密钥后，会话中即可调用 view_image 工具。",
+      nav: "识图插件（view_image · 外部 API）",
+      navSub: "外部识图工具，与 DSH 自带的 Flash Vision 并行、不会互相替换。聊天里粘贴的图走原生模型；本地路径 / URL / 纯文本模型仍走本插件的 view_image（默认智谱 glm-4.6v-flash）。",
       baseURLLabel: "API 地址",
       baseURLHint: "OpenAI 兼容 base URL，例如 https://open.bigmodel.cn/api/paas/v4 或 http://localhost:11434/v1",
       apiKeyLabel: "API 密钥",

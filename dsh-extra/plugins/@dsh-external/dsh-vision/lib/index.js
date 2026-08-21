@@ -1,9 +1,9 @@
 /**
- * dsh-vision: eyes for a text-only model. Registers a `view_image` tool that
- * forwards the model's question about an image to an OpenAI-compatible VLM
- * endpoint and returns the answer as text. Backend is fully configurable —
- * Zhipu's free glm-4.6v-flash (default), DashScope, Ark, a local Ollama, or
- * DeepSeek's own vision API the day it ships (users' existing key then just works).
+ * dsh-vision: external `view_image` tool. Forwards a question about an image
+ * to an OpenAI-compatible VLM and returns text. Stays registered next to
+ * DSH native Flash Vision — it does not replace or disable native image input.
+ * Backend is configurable: Zhipu glm-4.6v-flash (default), DashScope, Ark,
+ * local Ollama, or DeepSeek's own vision API.
  * @module dsh-vision
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -34,8 +34,20 @@ const NS = settingsNamespace('dsh-vision');
 // 配置的 getter；setSource 会被替换为 settings scope 读取器（热生效）。
 let liveConfig = () => ({});
 
-const PROMPT_TEXT = `## Vision (view_image)
-The chat model itself cannot see images, but the view_image tool can. Whenever an image matters — a screenshot path the user mentions, an image URL, a chart, a UI mockup — call view_image instead of guessing or refusing. Ask it a specific question (extract text, count objects, read a chart, describe the layout); it answers arbitrary questions, not just captions. Prefer one focused call per thing you need to know; ask a follow-up call rather than one vague question.`;
+const PROMPT_TEXT = `## Vision — two independent paths (keep both)
+
+There are TWO ways to see images. They are not alternatives to uninstall; both stay available.
+
+### 1) Native chat vision (DSH / DeepSeek Flash Vision)
+When the selected chat model accepts images (for example \`deepseek-v4-flash-vision-exp\`) AND the user attached/pasted an image in this conversation, look at those attached image blocks yourself. Do not refuse, and do not call view_image just to re-send an image that is already in the message.
+
+### 2) External vision tool (view_image) — always keep using this path when native cannot see the file
+\`view_image\` talks to a separate OpenAI-compatible VLM (default: Zhipu glm-4.6v-flash, not the DeepSeek chat model). It stays registered even when native vision is on. Call it when:
+- the selected chat model is text-only (no image input), OR
+- the user names a local screenshot/file path, http(s) URL, or data: URL that is NOT already an attached image in this message, OR
+- you need a second opinion from the external VLM.
+
+Ask a specific question (extract text, count objects, read a chart, describe the layout). Prefer one focused call per thing you need; follow up rather than one vague question. Never guess image contents when you cannot see them.`;
 const TEXT_OUTPUT = {
     schema: { type: 'string' },
     render: (_args, value) => [{ type: 'text', text: String(value) }],

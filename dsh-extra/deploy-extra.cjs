@@ -7,7 +7,7 @@
  *   它把仓库 dsh-extra/ 里离线打包的内容部署到本机，并挂上自制记忆插件：
  *     1) presets/  -> <引擎>/config/agent-presets/（8 个扩展预设，含 minimal-win）
  *     2) plugins/  -> ~/.dsh/profiles/web/node_modules/（伴侣插件：插件市场/识图/文件改动追踪等）
- *     3) dsh-trivium@0.4.3 -> ~/.dsh/profiles/web/node_modules/（npm 安装；本机若有 Desktop/dsh-trivium 源码则 junction，不把源码拷进本仓库；junction 后自动校验/补装 peer 依赖）
+ *     3) dsh-trivium -> ~/.dsh/profiles/web/node_modules/（跟 npm latest；本机若有 Desktop/dsh-trivium 源码则 junction）
  *     4) persona   -> 注入 ~/.dsh/profiles/web/cordis.patch.yml（oh-we-need 全局系统提示词）
  *     5) settings  -> 确保 ~/.dsh/settings.yaml 默认预设为 minimal-win
  * 全部幂等：已存在的内容跳过，可反复运行。
@@ -28,8 +28,10 @@ const PLUGIN_DST = path.join(PROFILE_WEB, "node_modules");
 const PRESET_DST = path.join(ENGINE_DIR, "config", "agent-presets");
 const PATCH_FILE = path.join(PROFILE_WEB, "cordis.patch.yml");
 const SETTINGS_FILE = path.join(DSH_HOME, "settings.yaml");
+const { viewVersion, viewVersionFrom, registryUrl, npmInstall } = require("./npm-registry.cjs");
 const TRIVIUM_PKG = "dsh-trivium";
-const TRIVIUM_VERSION = "0.4.3";
+const TRIVIUM_FALLBACK = "0.4.3";
+let TRIVIUM_VERSION = TRIVIUM_FALLBACK;
 const PATCH_HEAD = `# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; \`!!js\` expressions allowed).\n`;
 
 // 自包含：从 dsh-extra/lib 加载 js-yaml（不依赖仓库 node_modules 是否已安装）
@@ -91,15 +93,17 @@ function deployPlugins() {
   const src = path.join(HERE, "plugins");
   if (!fs.existsSync(src)) { warn("plugins 目录不存在，跳过"); return; }
   fs.mkdirSync(PLUGIN_DST, { recursive: true });
-  let n = 0;
+  // Companion plugins are owned by this repo: always refresh so vision prompt
+  // / sidebar / market copies in ~/.dsh pick up warehouse edits. Skip .bin
+  // and junctioned local checkouts (e.g. dsh-trivium) which are not in src.
   for (const p of fs.readdirSync(src)) {
+    if (p.startsWith(".")) continue;
     const s = path.join(src, p);
     const d = path.join(PLUGIN_DST, p);
-    if (fs.existsSync(d)) continue;
-    fs.mkdirSync(d, { recursive: true });
-    n += copyDir(s, d);
+    fs.cpSync(s, d, { recursive: true, force: true });
   }
-  log("伴侣插件已就位 -> " + PLUGIN_DST);
+  const names = fs.readdirSync(src).filter((x) => !x.startsWith("."));
+  log("伴侣插件已刷新: " + names.join(", ") + " -> " + PLUGIN_DST);
 }
 
 function deployPersona() {
@@ -238,18 +242,37 @@ function versionBehind(have, want) {
   return false;
 }
 
+function forceTriviumFromNpm() {
+  return /^(1|true|yes)$/i.test(String(process.env.DSH_TRIVIUM_FROM_NPM || ""));
+}
+
+function resolveTriviumWant() {
+  const v = viewVersion(TRIVIUM_PKG, 12000);
+  if (v) {
+    const mirror = viewVersionFrom(registryUrl(), TRIVIUM_PKG, 8000);
+    if (mirror && mirror !== v) {
+      log("npmjs latest " + TRIVIUM_PKG + " = " + v + "（镜像仍是 " + mirror + "，安装时会回退到 npmjs.org）");
+    } else {
+      log("npm latest " + TRIVIUM_PKG + " = " + v);
+    }
+    return v;
+  }
+  warn("npm view " + TRIVIUM_PKG + " 失败，回退 " + TRIVIUM_FALLBACK);
+  return TRIVIUM_FALLBACK;
+}
+
 function installNpmTrivium(dst) {
   log("正在 npm 安装 " + TRIVIUM_PKG + "@" + TRIVIUM_VERSION);
-  const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-  const r = cp.spawnSync(
-    npmCmd,
-    ["install", TRIVIUM_PKG + "@" + TRIVIUM_VERSION, "--save", "--registry=https://registry.npmmirror.com"],
-    { cwd: PROFILE_WEB, encoding: "utf8", shell: process.platform === "win32" }
+  const inst = npmInstall(
+    ["install", TRIVIUM_PKG + "@" + TRIVIUM_VERSION, "--save", "--no-audit", "--no-fund", "--legacy-peer-deps"],
+    { cwd: PROFILE_WEB }
   );
-  if (r.status !== 0) {
-    warn("npm 安装 dsh-trivium 失败: " + String(r.stderr || r.stdout || "unknown").slice(0, 800));
+  if (!inst.ok) {
+    const r = inst.result;
+    warn("npm 安装 dsh-trivium 失败: " + String((r && (r.stderr || r.stdout)) || "unknown").slice(0, 800));
     return false;
   }
+  log("安装源 " + inst.registry);
   const pkgFile = path.join(dst, "package.json");
   if (!fs.existsSync(pkgFile)) {
     warn("npm 安装 dsh-trivium 后仍找不到 " + pkgFile);
@@ -283,15 +306,13 @@ function ensureTriviumPeerDeps(dir) {
     return true;
   }
   log("dsh-trivium 缺 peer 依赖，正在补装: " + missing.join(", "));
-  const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
-  const r = cp.spawnSync(
-    npmCmd,
-    ["install", "--no-save", "--include=peer", "--legacy-peer-deps=false",
-     "--registry=https://registry.npmmirror.com", ...missing],
-    { cwd: real, encoding: "utf8", shell: process.platform === "win32" }
+  const inst = npmInstall(
+    ["install", "--no-save", "--include=peer", "--legacy-peer-deps=false", ...missing],
+    { cwd: real, shell: false }
   );
-  if (r.status !== 0) {
-    warn("补装 dsh-trivium peer 依赖失败: " + String(r.stderr || r.stdout || "unknown").slice(0, 800));
+  if (!inst.ok) {
+    const r = inst.result;
+    warn("补装 dsh-trivium peer 依赖失败: " + String((r && (r.stderr || r.stdout)) || "unknown").slice(0, 800));
     return false;
   }
   log("dsh-trivium peer 依赖已补装（" + missing.join(", ") + "）");
@@ -302,23 +323,43 @@ function ensureTriviumPackage() {
   const dst = path.join(PLUGIN_DST, TRIVIUM_PKG);
   const pkgFile = path.join(dst, "package.json");
   fs.mkdirSync(PLUGIN_DST, { recursive: true });
+  const fromNpm = forceTriviumFromNpm();
 
   let ok = false;
-  if (fs.existsSync(pkgFile) && isLink(dst)) {
-    log("dsh-trivium 已 junction -> 本地源码（" + readPkgVersion(pkgFile) + "），跳过 npm");
+  if (fs.existsSync(pkgFile) && isLink(dst) && !fromNpm) {
+    const have = readPkgVersion(pkgFile);
+    if (have !== TRIVIUM_VERSION) {
+      log("dsh-trivium 已 junction -> 本地源码（" + have + "），npm latest 是 " + TRIVIUM_VERSION + "；本机走源码不改。其他使用者没有 Desktop/dsh-trivium 时会跟 npm");
+    } else {
+      log("dsh-trivium 已 junction -> 本地源码（" + have + "），与 npm latest 一致，跳过 npm");
+    }
     ok = true;
+  } else if (fromNpm && fs.existsSync(pkgFile) && isLink(dst)) {
+    const sibling = siblingTrivium();
+    try { fs.rmdirSync(dst); } catch (e) { warn("无法拆掉 trivium junction: " + e.message); }
+    log("DSH_TRIVIUM_FROM_NPM=1，改为从 npm 安装");
+    ok = installNpmTrivium(dst);
+    if (!ok && sibling) {
+      try {
+        fs.symlinkSync(sibling, dst, process.platform === "win32" ? "junction" : "dir");
+        warn("npm 安装失败，已恢复 junction -> " + sibling);
+        ok = true;
+      } catch (e) {
+        warn("恢复 junction 也失败: " + e.message);
+      }
+    }
   } else if (fs.existsSync(pkgFile)) {
     const have = readPkgVersion(pkgFile);
-    if (!versionBehind(have, TRIVIUM_VERSION)) {
-      log("dsh-trivium@" + have + " 已在 web profile，跳过安装");
+    if (have === TRIVIUM_VERSION) {
+      log("dsh-trivium@" + have + " 已是 npm latest，跳过安装");
       ok = true;
     } else {
-      log("dsh-trivium@" + have + " 落后于 " + TRIVIUM_VERSION + "，改为 npm 升级");
+      log("dsh-trivium@" + have + " 与 npm latest " + TRIVIUM_VERSION + " 不同，改为 npm 安装");
       ok = installNpmTrivium(dst);
     }
   } else {
     const sibling = siblingTrivium();
-    if (sibling) {
+    if (!fromNpm && sibling) {
       try {
         fs.symlinkSync(sibling, dst, process.platform === "win32" ? "junction" : "dir");
         log("dsh-trivium 已 junction -> " + sibling);
@@ -328,7 +369,17 @@ function ensureTriviumPackage() {
         ok = installNpmTrivium(dst);
       }
     } else {
+      if (fromNpm) log("DSH_TRIVIUM_FROM_NPM=1，从 npm 安装（不 junction 本地源码）");
       ok = installNpmTrivium(dst);
+      if (!ok && sibling) {
+        try {
+          fs.symlinkSync(sibling, dst, process.platform === "win32" ? "junction" : "dir");
+          warn("npm 安装失败，已恢复 junction -> " + sibling);
+          ok = true;
+        } catch (e) {
+          warn("恢复 junction 也失败: " + e.message);
+        }
+      }
     }
   }
 
@@ -374,8 +425,56 @@ function ensureTriviumInsert() {
 }
 
 function deployTrivium() {
+  TRIVIUM_VERSION = resolveTriviumWant();
   if (!ensureTriviumPackage()) return;
   ensureTriviumInsert();
+}
+
+function pkgOnDisk(name) {
+  const rel = String(name).split("/");
+  const candidates = [
+    path.join(PLUGIN_DST, ...rel, "package.json"),
+    path.join(REPO, "node_modules", ...rel, "package.json"),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return candidates[0];
+}
+
+function reportLoadedPlugins() {
+  log("—— 已挂载插件 ——");
+  let bundles = [];
+  try {
+    bundles = JSON.parse(fs.readFileSync(path.join(PROFILE_WEB, "package.json"), "utf8")).dsh?.profile?.bundles || [];
+  } catch { /* no profile yet */ }
+  for (const name of bundles) {
+    if (String(name).startsWith("@deepseek-ai/dsh-base") || String(name).startsWith("@deepseek-ai/dsh-web-app")) continue;
+    const ver = readPkgVersion(pkgOnDisk(name));
+    log("  bundle  " + name + (ver ? " @" + ver : "  MISSING on disk"));
+  }
+  let patch = [];
+  try { patch = yaml.load(fs.readFileSync(PATCH_FILE, "utf8")) || []; } catch { /* none */ }
+  const seen = new Set();
+  for (const p of patch) {
+    if (!p || !Array.isArray(p.insert)) continue;
+    for (const row of p.insert) {
+      if (!row || !row.name || seen.has(row.id || row.name)) continue;
+      seen.add(row.id || row.name);
+      const ver = readPkgVersion(pkgOnDisk(row.name));
+      log("  insert  " + (row.id || "?") + " (" + row.name + ")" + (ver ? " @" + ver : "  MISSING on disk"));
+    }
+  }
+  const slotsInject = path.join(PLUGIN_DST, "dsh-better-sidebar", "package.json");
+  try {
+    const inj = JSON.parse(fs.readFileSync(slotsInject, "utf8")).dsh?.client?.inject || [];
+    if (inj.includes("@deepseek-ai/dsh-client-ui-slots")) {
+      const have = fs.existsSync(path.join(REPO, "node_modules", "@deepseek-ai", "dsh-client-ui-slots", "package.json"));
+      if (!have) {
+        warn("dsh-better-sidebar 仍 inject @deepseek-ai/dsh-client-ui-slots，当前引擎未带此包（等插件作者适配 0.1.1，不阻止启动）");
+      }
+    }
+  } catch { /* sidebar not deployed */ }
 }
 
 function deploySettings() {
@@ -401,6 +500,7 @@ function main() {
   deployTrivium();
   deployPersona();
   deploySettings();
+  reportLoadedPlugins();
   log("部署完成 ✓");
 }
 

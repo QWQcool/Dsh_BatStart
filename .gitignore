@@ -14,8 +14,7 @@ data/
 dsh-home/
 .workbuddy/
 
-# ===== 本仓库不需要的 npm 脚手架残留（引擎由 DSH Desktop 提供）=====
-package.json
+# ===== npm 锁文件（引擎由 .bat 跟 npm latest 安装，不入库）=====
 package-lock.json
 # 例外：离线伴侣插件需要 package.json 才能被 DSH Loader / client-modules 识别
 !dsh-extra/plugins/**/package.json

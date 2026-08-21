@@ -57,18 +57,20 @@ if exist "%SCRIPT_DIR%\.env" (
   for /f "usebackq tokens=1,* delims==" %%a in ("%SCRIPT_DIR%\.env") do (
     if not "%%a"=="" if not "%%a:~0,1"=="#" set "%%a=%%b"
   )
+) else (
+  if not defined DEEPSEEK_API_KEY (
+    echo [WARN] no .env and DEEPSEEK_API_KEY is empty.
+    echo        Copy .env.example to .env and fill in your DeepSeek key.
+  )
 )
 
-:: 4) install engine if missing (first run, needs network; npmmirror)
-if not exist "%DSH_BIN%" (
-  echo [Dsh_BatStart] dsh engine not found, installing @deepseek-ai/dsh
-  pushd "%SCRIPT_DIR%"
-  "%NODE_EXE%" -v >nul 2>&1
-  npm install @deepseek-ai/dsh --registry=https://registry.npmmirror.com 2>&1
-  popd
+:: 4) follow npm latest for @deepseek-ai/dsh (other clones do not wait for git)
+if exist "%SCRIPT_DIR%\dsh-extra\sync-from-npm.cjs" (
+  echo [Dsh_BatStart] checking npm for @deepseek-ai/dsh updates
+  "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\sync-from-npm.cjs"
 )
 if not exist "%DSH_BIN%" (
-  echo [ERROR] engine install failed. Check network or run: npm install @deepseek-ai/dsh
+  echo [ERROR] engine install failed. Check network. This launcher follows npm latest, not a git-pinned version.
   pause
   goto :eof
 )

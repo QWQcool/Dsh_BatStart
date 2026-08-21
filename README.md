@@ -1,6 +1,6 @@
 # Dsh_BatStart
 
-一键启动 **DeepSeek Harness（DSH）网页版**：双击 `.bat`，即在浏览器打开 DSH 并启动本地服务器。**自包含、不依赖 DSH Desktop**——引擎就在本仓库的 `node_modules/` 里（缺失或落后于脚本钉住的 `0.1.0-rc.8` 时 `.bat` 自动 `npm install`）。
+一键启动 **DeepSeek Harness（DSH）网页版**：双击 `.bat`，即在浏览器打开 DSH 并启动本地服务器。**自包含、不依赖 DSH Desktop**。引擎 **不进 git**：每次启动向 npm 查询 `@deepseek-ai/dsh` 的 `latest`，本机落后则自动升级（不跟 GitHub 源码仓）。别人 clone 后同样直接跟 npm，不必等本仓库先推一版。
 
 > 公式：`Model + Harness = Agent`。DSH 是 AI 智能体运行框架（对标 Claude Code / Codex），"一切皆插件"（模型 / 工具 / 预设 / 循环均可替换）。
 
@@ -16,7 +16,7 @@
    - `DEEPSEEK_API_KEY=sk-xxxx`（必填）
    - `ZHIPUAI_API_KEY=你的智谱Key`（选填，开启识图）
 2. 双击 `启动DSH网页版.bat`（或同名 ASCII 备用 `start-dsh-web.bat`）。
-3. 脚本依次：检查引擎（缺失或版本落后则安装/升级到 `0.1.0-rc.8`）→ **部署 `dsh-extra`（伴侣插件 + 扩展预设 + 全局提示词，并装上自制的跨会话记忆 `dsh-trivium`）** → 启动本地服务器（独立窗口，端口 **3090**）→ 约 4 秒后自动打开 `http://127.0.0.1:3090`。
+3. 脚本依次：向 npm 查询引擎 `latest`（落后则清 `node_modules` 重装）→ **部署 `dsh-extra`（伴侣插件 + 扩展预设 + 全局提示词，并按 npm latest 装自制记忆 `dsh-trivium`）并打印已挂载插件** → 启动本地服务器（独立窗口，端口 **3090**）→ 约 4 秒后自动打开 `http://127.0.0.1:3090`。
 4. 端口已占用则只开浏览器，不重复启动。关闭命令行窗口即停止服务。
 
 > 新机器（git clone 后）首次双击会联网安装引擎；安装与部署均为幂等，可反复运行。
@@ -56,24 +56,25 @@
 
 ## 自带：跨会话记忆
 
-启动时会装上自制插件 [dsh-trivium@0.4.3](https://www.npmjs.com/package/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。**普通用户无需拷贝任何源码**：本机没有 `Desktop/dsh-trivium` 源码时，脚本从 npm 安装（npm ≥7 会自动带上 `@deepseek-ai/dsh-llm` 等 peer 依赖），已装的旧版会升到 `0.4.3`（适配 DSH `0.1.0-rc.8`）。仅当本机恰好存在 `Desktop/dsh-trivium` 源码（开发者联调场景）才 junction 直连，且脚本会自动校验/补装该源码缺的 peer 依赖，两种路径都不会因缺依赖而启动失败。
+启动时会装上自制插件 [dsh-trivium](https://www.npmjs.com/package/dsh-trivium)（跟 npm latest；本机有 `Desktop/dsh-trivium` 源码则 junction）。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。**普通用户无需拷贝任何源码**。
 
 识图、侧边栏那些是可选的；记忆插件不是。
 
 ## 可选插件
 
-`dsh-extra/plugins` 部署后，设置里可按需打开：插件市场、识图（`view_image`，默认智谱 `glm-4.6v-flash`）、文件改动追踪、余额、侧边栏增强。
+`dsh-extra/plugins` 部署后，设置里可按需打开：插件市场、识图（外部 `view_image`，默认智谱 `glm-4.6v-flash`，与模型选择器里的官方 Flash Vision **并存**）、文件改动追踪、余额、侧边栏增强。
 
 ## 故障排查
 
 - 默认端口 3090；被占用可改 `.bat` 里的 `--port`。
 - 浏览器没自动开：手动访问 `http://127.0.0.1:3090`。
 - 报"未找到 node"：安装 Node.js 并确保在 `PATH`。
-- 报"引擎安装失败"：检查网络（首次 clone 或升级引擎时需联网安装 `@deepseek-ai/dsh@0.1.0-rc.8`）。
-- **升级 rc.8**：官方 SQLite 会话存储格式不兼容旧版，本地历史会话可能无法沿用；当新任务即可。
+- 报"引擎安装失败"：检查网络。启动脚本跟 **npmjs.org** 上的 `@deepseek-ai/dsh` / `dsh-trivium` `latest`（国内镜像未同步时会自动回退到 npmjs 安装）。升级引擎会清掉 `node_modules` 再装。
+- **升级预览版**：官方 SQLite 会话存储格式在 rc.8 起不兼容旧版；升引擎后本地历史会话可能无法沿用，当新任务即可。仓库拥有者升完后可把改过的 `package.json` commit/push，这只是记录，别人双击仍自己查 npm。
+- **识图两条路**：模型选择器里的 `DeepSeek-V4-Flash-Vision-Exp` 是 DSH 原生多模态（粘贴/附件直接进对话）；设置里的识图插件是外部 `view_image`（智谱等）。两者同时保留，不会互相卸载。
 - 全局提示词没生效：确认 `.bat` 输出了 `[Dsh_BatStart] 部署伴侣插件...` 且 `deploy-extra.cjs` 无报错；检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否含 `system-prompt` 条目。
-- 启动窗口报 `Cannot find package '@deepseek-ai/dsh-llm'`（`ERR_MODULE_NOT_FOUND`，来自 `Desktop/dsh-trivium`）：这是本机存在 trivium 源码、但其 `node_modules` 缺 peer 依赖（源码 `.npmrc` 若写了 `omit=peer`/`legacy-peer-deps=true` 会导致）。新版本脚本会自动补装；旧版本可手动执行：
-  `cd Desktop/dsh-trivium && npm install --no-save --include=peer --legacy-peer-deps=false @deepseek-ai/dsh-llm@0.1.0-rc.8 @deepseek-ai/dsh-tools@0.1.0-rc.8`
+- 启动窗口报 `Cannot find package '@deepseek-ai/dsh-llm'`（`ERR_MODULE_NOT_FOUND`，来自 `Desktop/dsh-trivium`）：这是本机存在 trivium 源码、但其 `node_modules` 缺 peer 依赖。脚本会自动补装；也可手动：
+  `cd Desktop/dsh-trivium && npm install --no-save --include=peer --legacy-peer-deps=false`
 
 ## License
 
