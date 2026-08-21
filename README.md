@@ -56,7 +56,7 @@
 
 ## 自带：跨会话记忆
 
-启动时会装上自制插件 [dsh-trivium@0.4.2](https://www.npmjs.com/package/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。本机若有 `Desktop/dsh-trivium` 源码则 junction 联调；否则从 npm 安装，已装的旧版会升到 `0.4.2`（适配 DSH `0.1.0-rc.8`）。
+启动时会装上自制插件 [dsh-trivium@0.4.3](https://www.npmjs.com/package/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。本机若有 `Desktop/dsh-trivium` 源码则 junction 联调；否则从 npm 安装，已装的旧版会升到 `0.4.3`（适配 DSH `0.1.0-rc.8`）。
 
 识图、侧边栏那些是可选的；记忆插件不是。
 
