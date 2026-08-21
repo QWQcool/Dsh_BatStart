@@ -7,7 +7,7 @@
  *   它把仓库 dsh-extra/ 里离线打包的内容部署到本机，并挂上自制记忆插件：
  *     1) presets/  -> <引擎>/config/agent-presets/（8 个扩展预设，含 minimal-win）
  *     2) plugins/  -> ~/.dsh/profiles/web/node_modules/（伴侣插件：插件市场/识图/文件改动追踪等）
- *     3) dsh-trivium@0.4.3 -> ~/.dsh/profiles/web/node_modules/（npm 安装；本机若有 Desktop/dsh-trivium 源码则 junction，不把源码拷进本仓库）
+ *     3) dsh-trivium@0.4.3 -> ~/.dsh/profiles/web/node_modules/（npm 安装；本机若有 Desktop/dsh-trivium 源码则 junction，不把源码拷进本仓库；junction 后自动校验/补装 peer 依赖）
  *     4) persona   -> 注入 ~/.dsh/profiles/web/cordis.patch.yml（oh-we-need 全局系统提示词）
  *     5) settings  -> 确保 ~/.dsh/settings.yaml 默认预设为 minimal-win
  * 全部幂等：已存在的内容跳过，可反复运行。
@@ -259,37 +259,82 @@ function installNpmTrivium(dst) {
   return true;
 }
 
+// dsh-trivium 通过 junction 直连本地源码时，源码文件夹必须自带 peer 依赖
+// （@deepseek-ai/dsh-llm / @deepseek-ai/dsh-tools 等）。若源码 .npmrc 有
+// omit=peer / legacy-peer-deps=true，node_modules/@deepseek-ai 会是空的，
+// DSH 启动加载插件树时直接 ERR_MODULE_NOT_FOUND 崩溃。这里校验缺失并自动补装。
+function ensureTriviumPeerDeps(dir) {
+  const real = fs.realpathSync(dir);
+  let peers = {};
+  try {
+    peers = JSON.parse(fs.readFileSync(path.join(real, "package.json"), "utf8")).peerDependencies || {};
+  } catch (e) {
+    warn("读取 dsh-trivium peerDependencies 失败，跳过校验: " + e.message);
+    return true;
+  }
+  const specs = Object.entries(peers).map(([name, ver]) => name + "@" + ver);
+  if (!specs.length) return true;
+  const missing = specs.filter((spec) => {
+    const name = spec.lastIndexOf("@") > 0 ? spec.slice(0, spec.lastIndexOf("@")) : spec;
+    return !fs.existsSync(path.join(real, "node_modules", name, "package.json"));
+  });
+  if (!missing.length) {
+    log("dsh-trivium peer 依赖齐全（" + specs.join(", ") + "）");
+    return true;
+  }
+  log("dsh-trivium 缺 peer 依赖，正在补装: " + missing.join(", "));
+  const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+  const r = cp.spawnSync(
+    npmCmd,
+    ["install", "--no-save", "--include=peer", "--legacy-peer-deps=false",
+     "--registry=https://registry.npmmirror.com", ...missing],
+    { cwd: real, encoding: "utf8", shell: process.platform === "win32" }
+  );
+  if (r.status !== 0) {
+    warn("补装 dsh-trivium peer 依赖失败: " + String(r.stderr || r.stdout || "unknown").slice(0, 800));
+    return false;
+  }
+  log("dsh-trivium peer 依赖已补装（" + missing.join(", ") + "）");
+  return true;
+}
+
 function ensureTriviumPackage() {
   const dst = path.join(PLUGIN_DST, TRIVIUM_PKG);
   const pkgFile = path.join(dst, "package.json");
   fs.mkdirSync(PLUGIN_DST, { recursive: true });
 
+  let ok = false;
   if (fs.existsSync(pkgFile) && isLink(dst)) {
     log("dsh-trivium 已 junction -> 本地源码（" + readPkgVersion(pkgFile) + "），跳过 npm");
-    return true;
-  }
-
-  if (fs.existsSync(pkgFile)) {
+    ok = true;
+  } else if (fs.existsSync(pkgFile)) {
     const have = readPkgVersion(pkgFile);
     if (!versionBehind(have, TRIVIUM_VERSION)) {
       log("dsh-trivium@" + have + " 已在 web profile，跳过安装");
-      return true;
+      ok = true;
+    } else {
+      log("dsh-trivium@" + have + " 落后于 " + TRIVIUM_VERSION + "，改为 npm 升级");
+      ok = installNpmTrivium(dst);
     }
-    log("dsh-trivium@" + have + " 落后于 " + TRIVIUM_VERSION + "，改为 npm 升级");
-    return installNpmTrivium(dst);
+  } else {
+    const sibling = siblingTrivium();
+    if (sibling) {
+      try {
+        fs.symlinkSync(sibling, dst, process.platform === "win32" ? "junction" : "dir");
+        log("dsh-trivium 已 junction -> " + sibling);
+        ok = true;
+      } catch (e) {
+        warn("junction dsh-trivium 失败，改从 npm 安装: " + e.message);
+        ok = installNpmTrivium(dst);
+      }
+    } else {
+      ok = installNpmTrivium(dst);
+    }
   }
 
-  const sibling = siblingTrivium();
-  if (sibling) {
-    try {
-      fs.symlinkSync(sibling, dst, process.platform === "win32" ? "junction" : "dir");
-      log("dsh-trivium 已 junction -> " + sibling);
-      return true;
-    } catch (e) {
-      warn("junction dsh-trivium 失败，改从 npm 安装: " + e.message);
-    }
-  }
-  return installNpmTrivium(dst);
+  // 无论 junction 还是 npm 路径，都校验/补装 peer 依赖，防止启动崩溃
+  if (ok) ensureTriviumPeerDeps(dst);
+  return ok;
 }
 
 function ensureTriviumInsert() {

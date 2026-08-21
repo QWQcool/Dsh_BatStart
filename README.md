@@ -56,7 +56,7 @@
 
 ## 自带：跨会话记忆
 
-启动时会装上自制插件 [dsh-trivium@0.4.3](https://www.npmjs.com/package/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。本机若有 `Desktop/dsh-trivium` 源码则 junction 联调；否则从 npm 安装，已装的旧版会升到 `0.4.3`（适配 DSH `0.1.0-rc.8`）。
+启动时会装上自制插件 [dsh-trivium@0.4.3](https://www.npmjs.com/package/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。**普通用户无需拷贝任何源码**：本机没有 `Desktop/dsh-trivium` 源码时，脚本从 npm 安装（npm ≥7 会自动带上 `@deepseek-ai/dsh-llm` 等 peer 依赖），已装的旧版会升到 `0.4.3`（适配 DSH `0.1.0-rc.8`）。仅当本机恰好存在 `Desktop/dsh-trivium` 源码（开发者联调场景）才 junction 直连，且脚本会自动校验/补装该源码缺的 peer 依赖，两种路径都不会因缺依赖而启动失败。
 
 识图、侧边栏那些是可选的；记忆插件不是。
 
@@ -72,6 +72,8 @@
 - 报"引擎安装失败"：检查网络（首次 clone 或升级引擎时需联网安装 `@deepseek-ai/dsh@0.1.0-rc.8`）。
 - **升级 rc.8**：官方 SQLite 会话存储格式不兼容旧版，本地历史会话可能无法沿用；当新任务即可。
 - 全局提示词没生效：确认 `.bat` 输出了 `[Dsh_BatStart] 部署伴侣插件...` 且 `deploy-extra.cjs` 无报错；检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否含 `system-prompt` 条目。
+- 启动窗口报 `Cannot find package '@deepseek-ai/dsh-llm'`（`ERR_MODULE_NOT_FOUND`，来自 `Desktop/dsh-trivium`）：这是本机存在 trivium 源码、但其 `node_modules` 缺 peer 依赖（源码 `.npmrc` 若写了 `omit=peer`/`legacy-peer-deps=true` 会导致）。新版本脚本会自动补装；旧版本可手动执行：
+  `cd Desktop/dsh-trivium && npm install --no-save --include=peer --legacy-peer-deps=false @deepseek-ai/dsh-llm@0.1.0-rc.8 @deepseek-ai/dsh-tools@0.1.0-rc.8`
 
 ## License
 
