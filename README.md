@@ -1,6 +1,6 @@
 # Dsh_BatStart
 
-一键启动 **DeepSeek Harness（DSH）网页版**：双击 `.bat`，即在浏览器打开 DSH 并启动本地服务器。**自包含、不依赖 DSH Desktop**——引擎就在本仓库的 `node_modules/` 里（缺失时 `.bat` 自动 `npm install`）。
+一键启动 **DeepSeek Harness（DSH）网页版**：双击 `.bat`，即在浏览器打开 DSH 并启动本地服务器。**自包含、不依赖 DSH Desktop**——引擎就在本仓库的 `node_modules/` 里（缺失或落后于脚本钉住的 `0.1.0-rc.8` 时 `.bat` 自动 `npm install`）。
 
 > 公式：`Model + Harness = Agent`。DSH 是 AI 智能体运行框架（对标 Claude Code / Codex），"一切皆插件"（模型 / 工具 / 预设 / 循环均可替换）。
 
@@ -16,7 +16,7 @@
    - `DEEPSEEK_API_KEY=sk-xxxx`（必填）
    - `ZHIPUAI_API_KEY=你的智谱Key`（选填，开启识图）
 2. 双击 `启动DSH网页版.bat`（或同名 ASCII 备用 `start-dsh-web.bat`）。
-3. 脚本依次：检查引擎（缺失则自动安装）→ **部署 `dsh-extra`（伴侣插件 + 扩展预设 + 全局提示词，并装上自制的跨会话记忆 `dsh-trivium`）** → 启动本地服务器（独立窗口，端口 **3090**）→ 约 4 秒后自动打开 `http://127.0.0.1:3090`。
+3. 脚本依次：检查引擎（缺失或版本落后则安装/升级到 `0.1.0-rc.8`）→ **部署 `dsh-extra`（伴侣插件 + 扩展预设 + 全局提示词，并装上自制的跨会话记忆 `dsh-trivium`）** → 启动本地服务器（独立窗口，端口 **3090**）→ 约 4 秒后自动打开 `http://127.0.0.1:3090`。
 4. 端口已占用则只开浏览器，不重复启动。关闭命令行窗口即停止服务。
 
 > 新机器（git clone 后）首次双击会联网安装引擎；安装与部署均为幂等，可反复运行。
@@ -52,11 +52,11 @@
 
 ## 预设
 
-默认用 `minimal-win`（Windows 极简：持久 bash + PowerShell 工具）。Web UI 可切换 `standard` / `code` / `minimal` / `minimal-win` / `router-standard` 等共 12 个（4 个官方 + 8 个来自 `dsh-extra/presets`）。
+默认用 `minimal-win`（Windows 极简：rc.8 起为持久 PowerShell PTY + 编辑器）。Web UI 可切换 `standard` / `code`（界面名 **PTC 模式**）/ `minimal` / `minimal-win` / `router-standard` 等共 12 个（4 个官方 + 8 个来自 `dsh-extra/presets`）。
 
 ## 自带：跨会话记忆
 
-启动时会装上自制插件 [dsh-trivium](https://github.com/QWQcool/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」。
+启动时会装上自制插件 [dsh-trivium@0.4.1](https://www.npmjs.com/package/dsh-trivium)。每个工作区一个 `.dsh/trivium.tdb`，关掉窗口再开，项目约定还在。设置里会出现「Trivium 记忆」，会话标题栏「对话 / 轨迹」旁会出现「会话图」。本机若有 `Desktop/dsh-trivium` 源码则 junction 联调；否则从 npm 安装，已装的旧版会升到 `0.4.1`（适配 DSH `0.1.0-rc.8`）。
 
 识图、侧边栏那些是可选的；记忆插件不是。
 
@@ -69,7 +69,8 @@
 - 默认端口 3090；被占用可改 `.bat` 里的 `--port`。
 - 浏览器没自动开：手动访问 `http://127.0.0.1:3090`。
 - 报"未找到 node"：安装 Node.js 并确保在 `PATH`。
-- 报"引擎安装失败"：检查网络（首次 clone 后需联网自动安装 dsh）。
+- 报"引擎安装失败"：检查网络（首次 clone 或升级引擎时需联网安装 `@deepseek-ai/dsh@0.1.0-rc.8`）。
+- **升级 rc.8**：官方 SQLite 会话存储格式不兼容旧版，本地历史会话可能无法沿用；当新任务即可。
 - 全局提示词没生效：确认 `.bat` 输出了 `[Dsh_BatStart] 部署伴侣插件...` 且 `deploy-extra.cjs` 无报错；检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否含 `system-prompt` 条目。
 
 ## License
