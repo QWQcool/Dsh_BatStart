@@ -30,7 +30,7 @@ const PATCH_FILE = path.join(PROFILE_WEB, "cordis.patch.yml");
 const SETTINGS_FILE = path.join(DSH_HOME, "settings.yaml");
 const { viewVersion, viewVersionFrom, registryUrl, npmInstall } = require("./npm-registry.cjs");
 const TRIVIUM_PKG = "dsh-trivium";
-const TRIVIUM_FALLBACK = "0.4.3";
+const TRIVIUM_FALLBACK = "0.4.6";
 let TRIVIUM_VERSION = TRIVIUM_FALLBACK;
 const PATCH_HEAD = `# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; \`!!js\` expressions allowed).\n`;
 
@@ -282,12 +282,59 @@ function installNpmTrivium(dst) {
   return true;
 }
 
-// dsh-trivium 通过 junction 直连本地源码时，源码文件夹必须自带 peer 依赖
-// （@deepseek-ai/dsh-llm / @deepseek-ai/dsh-tools 等）。若源码 .npmrc 有
-// omit=peer / legacy-peer-deps=true，node_modules/@deepseek-ai 会是空的，
-// DSH 启动加载插件树时直接 ERR_MODULE_NOT_FOUND 崩溃。这里校验缺失并自动补装。
+function hostPeerDir(name) {
+  const rel = String(name).split("/");
+  const candidates = [
+    path.join(REPO, "node_modules", ...rel),
+    path.join(PLUGIN_DST, ...rel),
+    path.join(DSH_HOME, "profiles", "node_modules", ...rel),
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, "package.json"))) return dir;
+  }
+  return null;
+}
+
+function removeLinkOrTree(target) {
+  try { fs.lstatSync(target); } catch { return; }
+  if (isLink(target)) {
+    try { fs.rmdirSync(target); } catch { try { fs.unlinkSync(target); } catch { /* ignore */ } }
+    return;
+  }
+  fs.rmSync(target, { recursive: true, force: true });
+}
+
+function junctionPeer(from, to) {
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  if (isLink(to)) {
+    try {
+      if (fs.readlinkSync(to) === from) return true;
+    } catch { /* recreate */ }
+    removeLinkOrTree(to);
+  } else if (fs.existsSync(path.join(to, "package.json"))) {
+    removeLinkOrTree(to);
+  } else if (fs.existsSync(to)) {
+    warn("拒绝覆盖非 junction 路径 " + to);
+    return false;
+  }
+  try {
+    fs.symlinkSync(from, to, process.platform === "win32" ? "junction" : "dir");
+    return true;
+  } catch (e) {
+    warn("junction peer 失败 " + to + ": " + e.message);
+    return false;
+  }
+}
+
+// 本地源码 junction 时，peer 必须和宿主是同一份（BlockAssembler instanceof）。
+// 不要 npm install --include=peer 嵌一套新的 dsh-llm。npm 安装的包走宿主解析，不补装。
 function ensureTriviumPeerDeps(dir) {
   const real = fs.realpathSync(dir);
+  const sibling = siblingTrivium();
+  if (!sibling || path.resolve(real) !== path.resolve(sibling)) {
+    log("dsh-trivium 为 npm 包，peer 走宿主，不嵌套补装");
+    return true;
+  }
   let peers = {};
   try {
     peers = JSON.parse(fs.readFileSync(path.join(real, "package.json"), "utf8")).peerDependencies || {};
@@ -295,28 +342,21 @@ function ensureTriviumPeerDeps(dir) {
     warn("读取 dsh-trivium peerDependencies 失败，跳过校验: " + e.message);
     return true;
   }
-  const specs = Object.entries(peers).map(([name, ver]) => name + "@" + ver);
-  if (!specs.length) return true;
-  const missing = specs.filter((spec) => {
-    const name = spec.lastIndexOf("@") > 0 ? spec.slice(0, spec.lastIndexOf("@")) : spec;
-    return !fs.existsSync(path.join(real, "node_modules", name, "package.json"));
-  });
-  if (!missing.length) {
-    log("dsh-trivium peer 依赖齐全（" + specs.join(", ") + "）");
-    return true;
+  const names = Object.keys(peers);
+  if (!names.length) return true;
+  let ok = true;
+  for (const name of names) {
+    const from = hostPeerDir(name);
+    const to = path.join(real, "node_modules", name);
+    if (!from) {
+      warn("宿主找不到 peer " + name + "，启动可能缺模块");
+      ok = false;
+      continue;
+    }
+    if (!junctionPeer(from, to)) ok = false;
+    else log("dsh-trivium peer " + name + " -> " + from);
   }
-  log("dsh-trivium 缺 peer 依赖，正在补装: " + missing.join(", "));
-  const inst = npmInstall(
-    ["install", "--no-save", "--include=peer", "--legacy-peer-deps=false", ...missing],
-    { cwd: real, shell: false }
-  );
-  if (!inst.ok) {
-    const r = inst.result;
-    warn("补装 dsh-trivium peer 依赖失败: " + String((r && (r.stderr || r.stdout)) || "unknown").slice(0, 800));
-    return false;
-  }
-  log("dsh-trivium peer 依赖已补装（" + missing.join(", ") + "）");
-  return true;
+  return ok;
 }
 
 function ensureTriviumPackage() {
