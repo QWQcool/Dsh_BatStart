@@ -8,31 +8,55 @@
  * retry, and repeated unreasoned failures surface the close code after three
  * attempts, so the banner never spins forever.
  *
+ * Three control frames shape the pty lifecycle on unmount:
+ * - `{type:'close'}` — the user closed the tab. The host kills the pty
+ *   immediately (quota released).
+ * - `{type:'park'}` — the user switched to another conversation. The tab is
+ *   still open in its session's persisted state but its view unmounted; the
+ *   host keeps the pty alive indefinitely (no grace countdown), so switching
+ *   back reattaches the same shell instead of respawning one.
+ * - bare socket drop (no frame) — page refresh, crash, plugin teardown, or a
+ *   same-session re-render. The host's reconnect grace keeps the shell alive
+ *   for a quick reconnect.
+ *
  * Two attach modes share one upgrade endpoint:
  * - `tabId` starting with `agent:` is an agent-owned terminal (created by
  *   the `terminal_create` tool). The uuid is the suffix after `agent:`; the
  *   view connects with `?uuid=...`. A close frame kills the pty (the agent's
  *   terminal closes when the user closes the tab); a bare socket drop
- *   leaves the pty alive (the agent owns the lifetime).
+ *   leaves the pty alive (the agent owns the lifetime) — agent terminals
+ *   never send park (their lifetime is already indefinite on bare drop).
  * - Any other `tabId` is a UI-tab terminal (the user created it from the +
  *   menu). The view connects with `?tab=...&sessionId=...&cwd=...`. A close
- *   frame schedules a 0-ms close; a bare socket drop gets the host's
- *   reconnect grace.
+ *   frame schedules a 0-ms close; a park frame marks the pty as parked; a
+ *   bare socket drop gets the host's reconnect grace.
  */
 import { useEffect, useRef, useState } from 'react'
-import { Terminal, type ITheme } from 'xterm'
+import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import 'xterm/css/xterm.css'
+import { writeClipboard } from '@deepseek-ai/dsh-client-ui-primitives'
+import '@xterm/xterm/css/xterm.css'
 import { t } from './locales.ts'
 import { openWhenSized } from './open-when-sized.ts'
-import type { SessionScope } from './api.ts'
+import { api, type SessionScope, type TerminalDepsStatus } from './api.ts'
 import { agentUuidOf, isAgentTabId, type SidebarStore } from './state.ts'
-import { isDarkScheme, subscribeColorScheme, tokenValue } from './theme.ts'
+import { isDarkScheme, subscribeColorScheme, effectiveTokenValue, tokenValue } from './theme.ts'
 import { resolveTerminalFont } from './terminal-font.ts'
 import css from './sidebar.module.css'
 
 /** How many consecutive unreasoned failures before showing the error banner. */
 const FAILURE_LIMIT = 3
+
+/**
+ * The WS close-code-1011 reason the host sends when node-pty is unavailable
+ * (mirror of the host's PTY_DEPS_MISSING; the value is a wire contract, so
+ * the two sides keep the literal in lockstep). The view then fetches the
+ * full repair details from /sidebar/api/terminal.deps.
+ */
+const PTY_DEPS_MISSING = 'pty-deps-missing'
+
+/** The degraded-mode payload rendered by {@link TerminalDepsBanner}. */
+type TerminalDepsInfo = Extract<TerminalDepsStatus, { ok: false }>
 
 /**
  * Curated ANSI palettes for the terminal. The surface colors (background,
@@ -61,8 +85,14 @@ const ANSI_LIGHT: Record<string, string> = {
 /** The xterm theme for the current scheme (surface from tokens, ANSI curated). */
 function xtermTheme(): ITheme {
   const dark = isDarkScheme()
-  const background = tokenValue('--dsw-alias-bg-base') || (dark ? '#111114' : '#ffffff')
-  const foreground = tokenValue('--dsw-alias-label-primary') || (dark ? '#e6e6e6' : '#1a1a1a')
+  // Skin systems set --dsw-alias-bg-base to `transparent` or translucent
+  // glass values (the dsh-web-ui skins use rgba 0.16–0.7); effectiveTokenValue
+  // treats those as unset below the opacity floor, so the opaque fallback
+  // engages and the terminal never renders see-through over the skin's
+  // backdrop (issue #90). Effectively opaque scoped surfaces (e.g. a skin's
+  // 0.96 porcelain) pass through — the skin still controls the terminal.
+  const background = effectiveTokenValue('--dsw-alias-bg-base') || (dark ? '#111114' : '#ffffff')
+  const foreground = effectiveTokenValue('--dsw-alias-label-primary') || (dark ? '#e6e6e6' : '#1a1a1a')
   return {
     background,
     foreground,
@@ -78,6 +108,7 @@ export function TerminalView(props: { scope: SessionScope; tabId: string; store:
   const hostRef = useRef<HTMLDivElement>(null)
   const [connected, setConnected] = useState(false)
   const [fatal, setFatal] = useState<string | null>(null)
+  const [depsFatal, setDepsFatal] = useState<TerminalDepsInfo | null>(null)
   const [lastUrl, setLastUrl] = useState<string | null>(null)
   const connectRef = useRef<(() => void) | null>(null)
 
@@ -151,6 +182,25 @@ export function TerminalView(props: { scope: SessionScope; tabId: string; store:
       }
       socket.onclose = (event) => {
         setConnected(false)
+        // node-pty dependency missing/broken (issue #140): the host closed
+        // with the short marker. Fetch the full repair details over HTTP —
+        // a WS close reason is capped at 123 bytes, too small for the
+        // pasteable command. A failed fetch falls back to the plain banner.
+        if (event.code === 1011 && event.reason === PTY_DEPS_MISSING) {
+          void api.terminalDeps().then((status) => {
+            if (status.ok) {
+              // The host recovered between the close and the fetch — the
+              // plain banner with a retry is the honest state.
+              setFatal(t('terminalDepsFailed'))
+              return
+            }
+            setFatal(null)
+            setDepsFatal(status)
+          }).catch(() => {
+            setFatal(t('terminalDepsFailed'))
+          })
+          return
+        }
         // A server-side refusal carries a close code + reason; retrying it
         // forever would only spin the banner, so surface it with a retry.
         if (event.code === 1011 && event.reason !== '') {
@@ -236,18 +286,31 @@ export function TerminalView(props: { scope: SessionScope; tabId: string; store:
       fontSub()
       schemeSub()
       inputSub.dispose()
-      // The close frame tells the host the owning tab is GONE (immediate
-      // pty release). A bare unmount — conversation switch, re-render,
-      // page unload — leaves the tab open, so the socket drop alone hands
-      // the process to the host's reconnect grace: switching back or
-      // refreshing reattaches the SAME shell instead of respawning one.
-      // (The host respawns on its own when the authoritative cwd changed.)
-      // Agent terminals follow the same rule: a close frame kills the pty
-      // (the user closed the sidebar tab); a bare socket drop leaves it
-      // alive (the agent owns the lifetime).
-      if (!store.tabOpen(scope.sessionId, tabId)
+      // Three unmount cases, distinguished by the store's tab/open state and
+      // the active session id:
+      // 1. The tab was closed by the user (NOT in its session's state): send
+      //    `{type:'close'}` — the host releases the pty immediately.
+      // 2. The user switched to another conversation (the tab IS still open
+      //    in scope.sessionId's state, but the active session is now a
+      //    different one): send `{type:'park'}` — the host keeps the pty
+      //    alive indefinitely (no grace countdown), so switching back
+      //    reattaches the SAME shell. Without this, the bare socket drop
+      //    would start the 30s reconnect-grace countdown and kill the shell
+      //    while the user is still actively working in the other session.
+      // 3. A same-session unmount (page refresh, crash, plugin teardown, a
+      //    re-render that re-mounts the view): bare socket drop — the host's
+      //    reconnect grace keeps the shell alive for a quick reconnect.
+      // Agent terminals follow the close-frame rule; their lifetime is owned
+      // by the agent, so a bare drop (case 3) already leaves them alive
+      // indefinitely — no park frame needed.
+      const tabStillOpen = store.tabOpen(scope.sessionId, tabId)
+      const sessionSwitched = store.getSnapshot().sessionId !== scope.sessionId
+      if (!tabStillOpen
         && socket !== null && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: 'close' }))
+      } else if (tabStillOpen && sessionSwitched && !isAgentTabId(tabId)
+        && socket !== null && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'park' }))
       }
       socket?.close()
       term.dispose()
@@ -257,6 +320,9 @@ export function TerminalView(props: { scope: SessionScope; tabId: string; store:
 
   return (
     <div className={css.terminalWrap}>
+      {depsFatal !== null && (
+        <TerminalDepsBanner deps={depsFatal} onRetry={() => { setDepsFatal(null); connectRef.current?.() }} />
+      )}
       {fatal !== null && (
         <div className={css.terminalBanner}>
           {t('terminalError')}: {fatal}
@@ -270,8 +336,48 @@ export function TerminalView(props: { scope: SessionScope; tabId: string; store:
           </button>
         </div>
       )}
-      {fatal === null && !connected && <div className={css.terminalBanner}>{t('disconnected')}</div>}
+      {fatal === null && depsFatal === null && !connected && <div className={css.terminalBanner}>{t('disconnected')}</div>}
       <div ref={hostRef} className={css.terminal} />
+    </div>
+  )
+}
+
+/**
+ * The node-pty dependency failure banner (issue #140): explains that the
+ * terminal's native dependency failed to load and shows the PASTEABLE repair
+ * command (bash / cmd / PowerShell) with a copy button — the user pastes it
+ * into a terminal where their DSH profile lives and runs it, then retries.
+ * Extracted as a standalone component for direct testing.
+ */
+export function TerminalDepsBanner(props: { deps: TerminalDepsInfo; onRetry: () => void }) {
+  const { deps, onRetry } = props
+  const [copied, setCopied] = useState(false)
+  const copy = async (): Promise<void> => {
+    const written = await writeClipboard(deps.command)
+    if (written) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 2000)
+    }
+  }
+  return (
+    <div className={css.terminalDepsBanner}>
+      <div className={css.terminalDepsTitle}>{t('terminalDepsFailed')}</div>
+      <div className={css.terminalDepsHint}>
+        {t('terminalDepsHint')}
+        {deps.profile !== null ? t('terminalDepsProfile', { profile: deps.profile }) : ''}
+      </div>
+      <div className={css.terminalDepsCommandRow}>
+        <pre className={css.terminalRepairCommand}>{deps.command}</pre>
+        <button type="button" className={css.terminalRetry} onClick={() => { void copy() }} aria-label={t('copy')}>
+          {copied ? t('copied') : t('copy')}
+        </button>
+      </div>
+      {deps.note !== undefined && <div className={css.terminalDepsNote}>{deps.note}</div>}
+      <div className={css.terminalDepsActions}>
+        <button type="button" className={css.terminalRetry} onClick={onRetry}>
+          {t('terminalRetry')}
+        </button>
+      </div>
     </div>
   )
 }

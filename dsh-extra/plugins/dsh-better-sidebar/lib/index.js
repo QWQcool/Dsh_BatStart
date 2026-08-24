@@ -1,16 +1,18 @@
 import { createRequire } from "node:module";
 import { mkdir, open, opendir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import z from "schemastery";
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { chmodSync, createWriteStream, existsSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { SettingsConflictError, settingsNamespace } from "@deepseek-ai/dsh-settings";
-import { chmodSync, existsSync } from "node:fs";
-import { userInfo } from "node:os";
-import * as nodePty from "node-pty";
+import { homedir, userInfo } from "node:os";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { snapshotSubagentDescriptor } from "@deepseek-ai/dsh-subagent";
 //#region src/prefs-shared.ts
 /**
 * Shared "Side card" preference vocabulary (types + constants), consumed by
@@ -33,9 +35,12 @@ const SIDEBAR_PREFS_NS = "dsh-better-sidebar";
 const Config = z.object({
 	readLimit: z.number().step(1).min(1).default(524288),
 	mediaLimit: z.number().step(1).min(1).default(20971520),
+	uploadLimit: z.number().step(1).min(1).default(134217728),
 	listLimit: z.number().step(1).min(1).default(1e3),
 	terminalsPerSession: z.number().step(1).min(1).default(3),
-	reconnectGraceMs: z.number().step(1).min(0).default(3e4)
+	reconnectGraceMs: z.number().step(1).min(0).default(3e4),
+	shell: z.string().default(""),
+	shellArgs: z.array(z.string()).default([])
 });
 /**
 * Apply direct-call defaults after Loader schema validation has normally run.
@@ -47,15 +52,18 @@ function resolveSidebarConfig(config) {
 	return {
 		readLimit: config?.readLimit ?? 524288,
 		mediaLimit: config?.mediaLimit ?? 20971520,
+		uploadLimit: config?.uploadLimit ?? 134217728,
 		listLimit: config?.listLimit ?? 1e3,
 		terminalsPerSession: config?.terminalsPerSession ?? 3,
-		reconnectGraceMs: config?.reconnectGraceMs ?? 3e4
+		reconnectGraceMs: config?.reconnectGraceMs ?? 3e4,
+		shell: config?.shell?.trim() ?? "",
+		shellArgs: config?.shellArgs ?? []
 	};
 }
 /** Schemastery schema for the user-facing preferences (validated by the settings service). */
 const PrefsSchema = z.object({
-	openByDefault: z.boolean().default(true),
-	defaultWidthPercent: z.number().step(1).min(20).max(60).default(30),
+	openByDefault: z.boolean().default(false),
+	defaultWidthPercent: z.number().step(1).min(20).max(60).default(35),
 	autoOpenSubagent: z.boolean().default(true),
 	autoOpenJobs: z.boolean().default(true),
 	agentTerminalTools: z.boolean().default(false),
@@ -63,6 +71,17 @@ const PrefsSchema = z.object({
 	terminalFontFamily: z.string().default(""),
 	terminalFontSize: z.number().step(1).min(9).max(32).default(13),
 	interceptOpenPath: z.boolean().default(true),
+	editorExplorer: z.boolean().default(false),
+	terminalShell: z.string().default(""),
+	terminalShellArgs: z.string().default(""),
+	titleBarScheme: z.union([
+		z.const("auto"),
+		z.const("web"),
+		z.const("preset"),
+		z.const("custom")
+	]),
+	titleBarPresetId: z.string(),
+	customCss: z.string(),
 	titleBarCompat: z.boolean().default(false),
 	titleBarStripPx: z.number().step(1).min(0).max(120).default(40),
 	htmlViewerNoSandbox: z.boolean().default(false),
@@ -152,8 +171,10 @@ function requireString(payload, key) {
 * Single-level directory listing for the sidebar explorer. Streams the level
 * with opendir, sorts directories first then names (case-insensitive), and
 * marks POSIX-hidden entries (dot-prefixed) for dimmed display. Symlinks are
-* reported as files without probing their target — the explorer shows what
-* dirent says, keeping the read cheap for arbitrarily large levels.
+* stat'ed once to expose their target kind — a symlink to a directory
+* expands like a directory — and dangling links are flagged broken. The
+* probe runs only for entries that are actually symlinks, so levels without
+* links stay as cheap as before.
 */
 /** Directory-first, case-insensitive name ordering (VSCode explorer order). */
 function compareEntries(a, b) {
@@ -186,18 +207,40 @@ async function listDirectory(path, maxEntries = 1e3) {
 				name: dirent.name,
 				path: join(path, dirent.name),
 				isDir: dirent.isDirectory(),
+				isSymlink: dirent.isSymbolicLink(),
+				broken: false,
 				hidden: dirent.name.startsWith(".")
 			});
 		}
 	} catch (error) {
 		throw new SidebarError("fs-error", `cannot list "${path}": ${messageOf(error)}`, 400);
 	}
+	await probeSymlinkTargets(rows);
 	rows.sort(compareEntries);
 	return {
 		path,
 		entries: rows,
 		truncated: overflow > 0
 	};
+}
+/** How many symlink target stats run in flight during one level listing. */
+const SYMLINK_PROBE_CONCURRENCY = 32;
+/** Probe each symlink row's target once (bounded concurrency, order-preserving). */
+async function probeSymlinkTargets(rows, concurrency = SYMLINK_PROBE_CONCURRENCY) {
+	let next = 0;
+	const workers = Array.from({ length: Math.min(concurrency, rows.length) }, async () => {
+		for (;;) {
+			const index = next;
+			next += 1;
+			if (index >= rows.length) return;
+			const row = rows[index];
+			if (!row.isSymlink) continue;
+			const info = await stat(row.path).catch(() => void 0);
+			row.isDir = info !== void 0 ? info.isDirectory() : row.isDir;
+			row.broken = info === void 0;
+		}
+	});
+	await Promise.all(workers);
 }
 /** The root row label of a listing: the last path segment (or the full path at the filesystem root). */
 function rootLabel(path) {
@@ -209,9 +252,15 @@ function parentOf(path) {
 	const parent = dirname(path);
 	return parent === path ? void 0 : parent;
 }
-/** Normalize a caller-supplied path to an absolute, resolved path or throw fs-error. */
+/**
+* Normalize a caller-supplied path to an absolute, resolved path or throw
+* fs-error. `path.isAbsolute()` is the OS's own notion of absolute: POSIX
+* roots (`/...`), Windows drive letters (`C:\...`) and — on win32 — UNC
+* network shares (`\\server\share\...`); drive-relative forms (`C:foo`)
+* stay rejected.
+*/
 function requireAbsolute(path) {
-	if (!path.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(path)) throw new SidebarError("fs-error", `"${path}" is not an absolute path`, 400);
+	if (!isAbsolute(path)) throw new SidebarError("fs-error", `"${path}" is not an absolute path`, 400);
 	return resolve(path);
 }
 /**
@@ -238,12 +287,151 @@ function isWithin(base, target, platform = process.platform) {
 function messageOf(error) {
 	return error instanceof Error ? error.message : String(error);
 }
+//#endregion
+//#region src/fs-operations.ts
+/**
+* Workspace-safe file mutations for the sidebar (the upload route today).
+*
+* Every write is lexically confined to the session workspace: the upload
+* directory is resolved absolute and must sit inside the session cwd, the
+* relative path is sanitized (absolute paths, '.', '..' and empty segments
+* are refused), and the final target must stay inside both. Containment is
+* lexical (no symlink resolution) — a symlinked directory inside the cwd can
+* redirect writes outside, matching the trust model of the other /sidebar/*
+* routes. Bytes stream from the request body to a uniquely named temp sibling
+* and are renamed into place, so a failed, aborted, or oversized upload never
+* leaves a partial file at the target path.
+*/
+/**
+* Stream `chunks` into `dir/relativePath` atomically: a uniquely named temp
+* sibling receives the bytes, then is renamed over the target. The parent
+* directory is created on demand (recursive), so folder uploads work before
+* any level exists. The unique temp name keeps concurrent uploads to the same
+* target independent (each writes and renames its own file; the last rename
+* wins) and never blocks later uploads after a crashed process.
+*
+* @throws SidebarError with a wire code for containment, shape, and size
+* failures; the temp file is always removed on failure.
+*/
+async function writeWorkspaceUpload(input) {
+	const { cwd, dir, relativePath, chunks, limit } = input;
+	const base = requireAbsolute(dir);
+	if (!isWithin(cwd, base)) throw new SidebarError("forbidden", "upload directory escapes the session workspace", 403);
+	if (relativePath === "" || relativePath.startsWith("/") || relativePath.startsWith("\\")) throw new SidebarError("bad-request", "relativePath must stay below the upload directory", 400);
+	const segments = relativePath.split(/[\\/]/);
+	if (segments.some((part) => part === "" || part === "." || part === "..")) throw new SidebarError("bad-request", "relativePath must stay below the upload directory", 400);
+	const target = join(base, ...segments);
+	if (!isWithin(cwd, target) || !isWithin(base, target)) throw new SidebarError("forbidden", "target escapes the session workspace", 403);
+	const tmp = join(dirname(target), `.${basename(target)}.dsh-upload-${randomUUID()}.tmp`);
+	await mkdir(dirname(target), { recursive: true });
+	const stream = createWriteStream(tmp, { flags: "wx" });
+	const closed = new Promise((resolve) => {
+		stream.once("close", () => resolve());
+	});
+	let size = 0;
+	let streamError;
+	stream.on("error", (error) => {
+		streamError = error;
+	});
+	try {
+		for await (const chunk of chunks) {
+			const buffer = Buffer.from(chunk);
+			size += buffer.length;
+			if (size > limit) throw new SidebarError("too-large", `upload exceeds the ${limit} byte limit`, 413);
+			if (!stream.write(buffer)) await once(stream, "drain");
+			if (streamError !== void 0) throw streamError;
+		}
+		await new Promise((resolve, reject) => {
+			stream.end((error) => error === void 0 || error === null ? resolve() : reject(error));
+		});
+		if (streamError !== void 0) throw streamError;
+		await rename(tmp, target);
+		return {
+			path: target,
+			size: (await stat(target)).size
+		};
+	} catch (error) {
+		stream.destroy();
+		await closed.catch(() => {});
+		await rm(tmp, { force: true }).catch(() => {});
+		throw error;
+	}
+}
+//#endregion
+//#region src/fs-search.ts
+/**
+* Recursive file-name search for the editor's merged-mode side panel.
+* Streams the tree with opendir and matches the query as a case-insensitive
+* substring of each entry's NAME (paths stay relative to the search root —
+* the client resolves them against the session cwd). No .gitignore semantics
+* (this is a name lookup, not a code search), but `.git` directories are
+* skipped outright (VCS internals are never useful results) and symlink
+* directories are NOT descended (cycle safety).
+*
+* Two performance budgets bound the walk: `maxMatches` (the client renders
+* the flat list) and `maxVisited` (a runaway tree — a home directory root,
+* a node_modules forest — must not stall the host). Exceeding either stops
+* early with `truncated: true`.
+*/
+const DEFAULT_MAX_MATCHES = 200;
+const DEFAULT_MAX_VISITED = 1e5;
+/**
+* Search `root` recursively for entries whose name contains `query`
+* (case-insensitive).
+* @param root - absolute search root.
+* @param query - the name substring; empty matches nothing.
+* @param opts - budget overrides (tests).
+* @returns the matching paths RELATIVE to `root` ('/'-separated), sorted,
+*  plus whether a budget cut the walk short. An unreadable level is skipped
+*  (permission errors never fail the whole search).
+*/
+async function searchFiles(root, query, opts = {}) {
+	const needle = query.trim().toLowerCase();
+	if (needle === "") return {
+		matches: [],
+		truncated: false
+	};
+	const maxMatches = opts.maxMatches ?? DEFAULT_MAX_MATCHES;
+	const maxVisited = opts.maxVisited ?? DEFAULT_MAX_VISITED;
+	const matches = [];
+	let visited = 0;
+	let truncated = false;
+	const walk = async (dir) => {
+		if (truncated) return;
+		const level = await opendir(dir).catch(() => void 0);
+		if (level === void 0) return;
+		for await (const dirent of level) {
+			visited += 1;
+			if (visited > maxVisited) {
+				truncated = true;
+				return;
+			}
+			if (dirent.isDirectory() && dirent.name === ".git") continue;
+			if (dirent.name.toLowerCase().includes(needle)) {
+				matches.push(join(relative(root, dir), dirent.name));
+				if (matches.length >= maxMatches) {
+					truncated = true;
+					return;
+				}
+			}
+			if (dirent.isDirectory() && !dirent.isSymbolicLink()) {
+				await walk(join(dir, dirent.name));
+				if (truncated) return;
+			}
+		}
+	};
+	await walk(root);
+	return {
+		matches: matches.sort().map((path) => path.split(sep).join("/")),
+		truncated
+	};
+}
 /**
 * Decode a route pathname into the session + absolute file path. Rejects
-* a wrong prefix (404), an empty or double-slash path, malformed percent
-* encoding, and a missing sessionId or file path (400). The caller still
-* must bound the decoded path with requireAbsolute + isWithin(cwd) — a
-* decoded `..` segment resolves outside the cwd and is refused there.
+* a wrong prefix (404), an empty path, malformed percent encoding, and a
+* missing sessionId or file path (400). The caller still must bound the
+* decoded path with requireAbsolute + isWithin(cwd) — a decoded `..`
+* segment resolves outside the cwd and is refused there.
 */
 function decodeHtmlUrl(pathname) {
 	if (!pathname.startsWith("/sidebar/html/")) return {
@@ -252,7 +440,7 @@ function decodeHtmlUrl(pathname) {
 		message: "not an html route"
 	};
 	const rest = pathname.slice(14);
-	if (rest === "" || rest.includes("//")) return {
+	if (rest === "") return {
 		ok: false,
 		status: 400,
 		message: "invalid html route path"
@@ -268,17 +456,27 @@ function decodeHtmlUrl(pathname) {
 		};
 	}
 	const [sessionId, ...pathSegments] = segments;
-	if (sessionId === void 0 || sessionId === "" || pathSegments.length === 0 || pathSegments.some((segment) => segment === "")) return {
+	if (sessionId === void 0 || sessionId === "") return {
 		ok: false,
 		status: 400,
 		message: "sessionId and file path are required"
 	};
-	const first = pathSegments[0] ?? "";
+	const unc = pathSegments[0] === "";
+	const tail = unc ? pathSegments.slice(1) : pathSegments;
+	if (tail.length === 0 || tail.some((segment) => segment === "")) return {
+		ok: false,
+		status: 400,
+		message: "sessionId and file path are required"
+	};
+	let path;
+	if (unc) path = `//${tail.join("/")}`;
+	else if (/^[A-Za-z]:$/.test(tail[0] ?? "")) path = tail.join("/");
+	else path = `/${tail.join("/")}`;
 	return {
 		ok: true,
 		ref: {
 			sessionId,
-			path: /^[A-Za-z]:$/.test(first) ? pathSegments.join("/") : `/${pathSegments.join("/")}`
+			path
 		}
 	};
 }
@@ -379,7 +577,11 @@ function isTrustedApiRequest(request, trustedHosts) {
 * only allowlisted chunk names are servable (no path traversal).
 */
 /** The chunk names the client may request (mirror of src/client/chunk-loader.ts). */
-const CHUNK_NAMES = ["terminal", "editor"];
+const CHUNK_NAMES = [
+	"terminal",
+	"editor",
+	"mermaid"
+];
 /** Directory of this host-half module (lib/ — the chunk scripts live next to it). */
 const LIB_DIR = dirname(fileURLToPath(import.meta.url));
 /** sha1 content hash shortened to 12 hex chars (same shape as the client-modules rev). */
@@ -472,6 +674,84 @@ function registerBundleRoute(ctx, fence) {
 	});
 }
 //#endregion
+//#region src/open-external.ts
+/**
+* External open actions for the file tree's "open with" menu: hand a path to
+* the OS file manager (reveal/select) or launch a URL scheme's registered
+* handler (vscode://, cursor://, zed://, custom schemes).
+*
+* The client runs in a browser / DSH Desktop renderer where a raw `vscode://`
+* navigation is unreliable, so both actions fan out through this host route
+* and spawn the platform opener with an argv array (no shell interpolation).
+* The command builders are pure — the platform is injectable — so every
+* per-platform branch is unit-testable without spawning anything.
+*/
+/** Reveal/select a path in the OS file manager. On Linux there is no common
+*  select protocol — the containing directory is opened instead (KISS). */
+function revealCommand(path, platform = process.platform) {
+	switch (platform) {
+		case "darwin": return {
+			command: "open",
+			args: ["-R", path]
+		};
+		case "win32": return {
+			command: "explorer.exe",
+			args: ["/select,", path]
+		};
+		default: return {
+			command: "xdg-open",
+			args: [parentOf(path) ?? path]
+		};
+	}
+}
+/** Hand a custom-scheme URL to the OS protocol handler. */
+function urlCommand(url, platform = process.platform) {
+	switch (platform) {
+		case "darwin": return {
+			command: "open",
+			args: [url]
+		};
+		case "win32": return {
+			command: "rundll32.exe",
+			args: ["url.dll,FileProtocolHandler", url]
+		};
+		default: return {
+			command: "xdg-open",
+			args: [url]
+		};
+	}
+}
+/** Validate a URL-scheme open target: a parseable custom-scheme URL (never
+*  http/https — those would only dump the URL into a browser tab). */
+function validateExternalUrl(raw) {
+	if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) throw new SidebarError("bad-request", "url must be a custom-scheme URL");
+	let url;
+	try {
+		url = new URL(raw);
+	} catch {
+		throw new SidebarError("bad-request", "invalid url");
+	}
+	if (url.protocol === "http:" || url.protocol === "https:") throw new SidebarError("bad-request", "only custom-scheme urls can be opened externally");
+	return raw;
+}
+/**
+* Launch one external open action and return immediately (detached, no
+* stdio). Spawn failures are reported through the child's 'error' event —
+* by then the route already returned, so the event is swallowed (the OS
+* dialog about a missing handler is the user-visible outcome either way).
+*/
+function launchExternal(action, value) {
+	const platform = process.platform;
+	const spec = action === "reveal" ? revealCommand(requireAbsolute(value), platform) : urlCommand(validateExternalUrl(value), platform);
+	const child = spawn(spec.command, spec.args, {
+		detached: true,
+		stdio: "ignore"
+	});
+	child.on("error", () => {});
+	child.unref();
+	return { started: true };
+}
+//#endregion
 //#region src/git.ts
 /**
 * Git operations for the sidebar source-control panel. Everything goes
@@ -548,6 +828,7 @@ function runGit(cwd, args, timeoutMs = 3e4) {
 				"pipe",
 				"pipe"
 			],
+			windowsHide: true,
 			env: {
 				...process.env,
 				GIT_OPTIONAL_LOCKS: "0"
@@ -596,7 +877,14 @@ async function currentBranch(cwd) {
 		"HEAD"
 	])).trim();
 }
-/** Working-tree status (untracked included). */
+/**
+* Working-tree status (untracked included). `--untracked-files=all` lists
+* the CONTENTS of new directories as individual entries (`?? newdir/a.ts`
+* rather than a collapsed `?? newdir/`), so every row in the source-control
+* panel is a real file whose diff tab can load. With `=normal`, git folds a
+* new folder into one trailing-slash entry that has no diff output and
+* cannot be read as a file.
+*/
 async function status(cwd) {
 	if (!await isGitRepo(cwd)) return {
 		isRepo: false,
@@ -606,7 +894,7 @@ async function status(cwd) {
 		"status",
 		"--porcelain=v1",
 		"-z",
-		"--untracked-files=normal"
+		"--untracked-files=all"
 	])]);
 	return {
 		isRepo: true,
@@ -725,6 +1013,179 @@ async function cherryPick(cwd, hash) {
 	await runGit(cwd, ["cherry-pick", hash]);
 }
 //#endregion
+//#region src/pty-deps.ts
+/**
+* node-pty dependency loading for the host half (issue #140, plugin side).
+*
+* The terminal surfaces (UI tabs + model-facing terminal_* tools) need
+* node-pty, but the package must NEVER be imported statically at module
+* top level: a missing or broken install (pnpm 11's strict-dep-builds
+* skipping node-pty's install script, a pruned store entry, a failed
+* prebuilt-binary download…) would then fail the plugin module load and —
+* because a loader entry apply failure aborts the boot — take the whole
+* `dsh web` server down with it.
+*
+* Instead the host half loads node-pty lazily (synchronously, via
+* createRequire — the same resolution `ensureSpawnHelper` already uses in
+* production). When the load fails the plugin stays mounted in a degraded
+* state: the terminal tab shows a friendly error carrying a pasteable
+* repair command (see scripts/install.sh / install.ps1 `--repair`), and the
+* agent terminal tools are simply not registered.
+*
+* Version contract: the plugin must stay in sync with DSH core —
+* `@deepseek-ai/dsh-subprocess-local` declares `"node-pty": "^1.1.0"` in
+* its `dependencies`. Both sides then resolve the SAME pnpm store entry
+* (same range, same integrity → one native binding, no drift). Do NOT
+* switch to a fork (e.g. @lydell/node-pty) or a different range without
+* re-checking the core declaration.
+*/
+/**
+* The node-pty version range this plugin ships. MUST stay identical to the
+* range DSH core declares (`@deepseek-ai/dsh-subprocess-local`): the same
+* range keeps pnpm resolving both to one physical package.
+*/
+const DSH_NODE_PTY_RANGE = "^1.1.0";
+/**
+* The WebSocket close-code-1011 reason the host sends when node-pty is
+* unavailable. The client recognizes this exact marker and fetches the full
+* repair details from `/sidebar/api/terminal.deps` (a WS close reason is
+* capped at 123 bytes, so the command itself cannot ride the close frame).
+*/
+const PTY_DEPS_MISSING = "pty-deps-missing";
+const defaultRequire = createRequire(import.meta.url);
+let cached;
+/**
+* Load node-pty once (synchronously) and cache the outcome. Returns null
+* when the package or its native binding cannot be loaded; the cause stays
+* queryable through {@link nodePtyLoadCause}. Never throws.
+*/
+function loadNodePty(requireImpl = defaultRequire) {
+	if (cached === void 0) try {
+		cached = {
+			ok: true,
+			module: requireImpl("node-pty")
+		};
+	} catch (cause) {
+		cached = {
+			ok: false,
+			cause
+		};
+	}
+	return cached.ok ? cached.module : null;
+}
+/** The recorded load failure (undefined when the load succeeded or never ran). */
+function nodePtyLoadCause() {
+	return cached !== void 0 && !cached.ok ? cached.cause : void 0;
+}
+/** Load node-pty or throw the canonical degraded-mode error (class-constructor default). */
+function loadRequiredNodePty() {
+	const module = loadNodePty();
+	if (module === null) {
+		const cause = describeCause(nodePtyLoadCause());
+		throw new SidebarError("pty-deps-missing", `node-pty (${DSH_NODE_PTY_RANGE}) failed to load: ${cause} — run the repair command shown in the terminal tab`, 503);
+	}
+	return module;
+}
+/** Resolve a directory to its physical location (symlinked/link: installs). */
+function realDir(file) {
+	try {
+		return dirname(realpathSync(file));
+	} catch {
+		return dirname(file);
+	}
+}
+/** Walk up from `dir` looking for a DSH profile root (package.json + pnpm-workspace.yaml). */
+function walkUp(dir, isRoot) {
+	let current = dir;
+	for (let depth = 0; depth < 16; depth += 1) {
+		if (isRoot(current)) return current;
+		const parent = dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return null;
+}
+/** Whether `dir` looks like a DSH profile root (the plugin lives under its node_modules). */
+function isProfileRoot(dir) {
+	return existsSync(join(dir, "package.json")) && existsSync(join(dir, "pnpm-workspace.yaml"));
+}
+/**
+* Detect the DSH profile directory this plugin is installed into: the
+* nearest ancestor of the plugin module that carries both `package.json`
+* and `pnpm-workspace.yaml` (the profile root; the plugin resolves from the
+* profile's node_modules). Falls back to `$DSH_HOME/profiles/web` (the
+* standard web profile), then null.
+*/
+function findProfileDir(fromFile = fileURLToPath(import.meta.url)) {
+	const detected = walkUp(realDir(fromFile), isProfileRoot);
+	if (detected !== null) return detected;
+	const home = process.env.DSH_HOME !== void 0 && process.env.DSH_HOME.trim() !== "" ? process.env.DSH_HOME : join(homedir(), ".dsh");
+	const web = join(home, "profiles", "web");
+	return isProfileRoot(web) ? realpathSync(web) : null;
+}
+/** Whether `dir`'s package.json declares this plugin's name. */
+function isPluginRoot(dir) {
+	const file = join(dir, "package.json");
+	if (!existsSync(file)) return false;
+	try {
+		return JSON.parse(readFileSync(file, "utf8")).name === "dsh-better-sidebar";
+	} catch {
+		return false;
+	}
+}
+/** The plugin package root (walk-up from the module; works for lib/ and src/ layouts). */
+function findPluginRoot(fromFile = fileURLToPath(import.meta.url)) {
+	return walkUp(realDir(fromFile), isPluginRoot);
+}
+/**
+* The pasteable repair command for a broken node-pty install: rerun the
+* plugin's own installer in `--repair` mode (idempotent: it re-writes the
+* profile's `allowBuilds: node-pty: true` and re-installs/rebuilds the
+* dependency). Falls back to DSH's plugin command when the scripts are not
+* shipped (exotic layouts).
+*/
+function buildRepairCommand(options) {
+	const { pluginRoot, profileDir } = options;
+	const platform = options.platform ?? process.platform;
+	const profileName = profileDir !== null ? basename(profileDir) : null;
+	const profileArg = profileName !== null ? platform === "win32" ? ` -Profile "${profileName}"` : ` --profile "${profileName}"` : "";
+	if (pluginRoot !== null) {
+		if (platform === "win32") {
+			const script = join(pluginRoot, "scripts", "install.ps1");
+			if (existsSync(script)) return { command: `powershell -ExecutionPolicy Bypass -File "${script}" -Repair${profileArg}` };
+		} else {
+			const script = join(pluginRoot, "scripts", "install.sh");
+			if (existsSync(script)) return { command: `bash "${script}" --repair${profileArg}` };
+		}
+	}
+	return {
+		command: `dsh plugin --profile "${profileName ?? "web"}" install`,
+		note: "If pnpm 11 blocked node-pty's build script, ensure `allowBuilds: node-pty: true` in the profile's pnpm-workspace.yaml (the plugin's scripts/install.sh / install.ps1 --repair does this automatically)."
+	};
+}
+/** One-line human description of the recorded load cause. */
+function describeCause(cause) {
+	if (cause instanceof Error) return cause.message;
+	return String(cause);
+}
+/** Current node-pty dependency status (loaded vs degraded + repair info). */
+function depsStatus(options = {}) {
+	if (loadNodePty() !== null) return { ok: true };
+	const pluginRoot = findPluginRoot(options.fromFile);
+	const profileDir = findProfileDir(options.fromFile);
+	const { command, note } = buildRepairCommand({
+		pluginRoot,
+		profileDir
+	});
+	return {
+		ok: false,
+		cause: describeCause(nodePtyLoadCause()),
+		command,
+		profile: profileDir !== null ? basename(profileDir) : null,
+		...note !== void 0 ? { note } : {}
+	};
+}
+//#endregion
 //#region src/pty-manager.ts
 /**
 * PTY session table for the sidebar terminals. One node-pty process per
@@ -755,15 +1216,41 @@ function ensureSpawnHelper() {
 /**
 * The terminal registry. `maxPerSession` bounds concurrent processes per
 * conversation (the client caps tabs at the same number).
+*
+* Lifecycle of a UI-tab pty when its WebSocket drops:
+* - **Close frame** (`{type:'close'}`): the user closed the tab → schedule a
+*   0-ms close (quota released immediately).
+* - **Park frame** (`{type:'park'}`): the user switched to another
+*   conversation; the tab is still open in its session's persisted state but
+*   its view unmounted → mark the pty as parked (no auto-close countdown).
+*   The pty stays alive until the user switches back (a reconnecting view
+*   calls `open()` which clears the parked state) or the tab is later closed
+*   (a `{type:'close'}` frame from a fresh connection). Without `park`, a
+*   bare socket drop would start the reconnect-grace countdown and kill the
+*   shell after `reconnectGraceMs` — wrong for a session switch, where the
+*   user is still actively using the app, just in another conversation.
+* - **Bare socket drop** (no frame): page refresh, crash, plugin teardown →
+*   schedule a close after `reconnectGraceMs` so a quick reconnect reattaches
+*   the same shell.
 */
 var PtyManager = class {
 	shell;
 	maxPerSession;
+	shellArgs;
+	nodePty;
 	sessions = /* @__PURE__ */ new Map();
 	pendingCloses = /* @__PURE__ */ new Map();
-	constructor(shell, maxPerSession) {
+	/** Tabs whose view unmounted because the user switched conversations — the
+	*  tab is still open in its session's state, so the pty must NOT enter the
+	*  reconnect-grace countdown. Cleared by `cancelClose` (a reconnecting
+	*  view's `open()` cancels it) or by `scheduleClose` (an explicit close
+	*  frame still kills a parked pty). */
+	parked = /* @__PURE__ */ new Set();
+	constructor(shell, maxPerSession, shellArgs = [], nodePty = loadRequiredNodePty()) {
 		this.shell = shell;
 		this.maxPerSession = maxPerSession;
+		this.shellArgs = shellArgs;
+		this.nodePty = nodePty;
 	}
 	/** All live terminal keys of one session. */
 	keysOf(sessionId) {
@@ -789,7 +1276,7 @@ var PtyManager = class {
 	* @returns the live handle.
 	* @throws {SidebarError} pty-error when the per-session cap is reached.
 	*/
-	open(sessionId, tabId, cwd, cols, rows) {
+	open(sessionId, tabId, cwd, cols, rows, shell, shellArgs) {
 		const key = `${sessionId}:${tabId}`;
 		this.cancelClose(key);
 		const existing = this.sessions.get(key);
@@ -802,7 +1289,7 @@ var PtyManager = class {
 			sessionId,
 			tabId,
 			cwd,
-			pty: nodePty.spawn(this.shell, shellSpawnArgs(), {
+			pty: this.nodePty.spawn(shell ?? this.shell, shellSpawnArgs(shellArgs ?? this.shellArgs), {
 				name: "xterm-256color",
 				cols: Math.max(2, Math.floor(cols)),
 				rows: Math.max(2, Math.floor(rows)),
@@ -827,7 +1314,9 @@ var PtyManager = class {
 	* Schedule the terminal's destruction after `delayMs`. A tab close sends
 	* delay 0 (release the quota immediately); a bare socket drop (refresh,
 	* crash) uses the grace period so a quick reconnect keeps the process.
-	* `open()` cancels any pending close.
+	* `open()` cancels any pending close. Clears the parked state — an explicit
+	* close frame on a parked pty (the user switched back and closed the tab)
+	* still kills it.
 	*/
 	scheduleClose(key, delayMs) {
 		if (this.sessions.get(key) === void 0) return;
@@ -837,13 +1326,34 @@ var PtyManager = class {
 		}, delayMs);
 		this.pendingCloses.set(key, timer);
 	}
-	/** Cancel a pending scheduled close (the terminal is being reopened). */
+	/**
+	* Park a terminal: the owning tab's view unmounted because the user
+	* switched to another conversation, but the tab is still open in its
+	* session's persisted state. Cancels any pending grace close and marks
+	* the pty so the host's `ws.on('close')` handler does NOT start the
+	* reconnect-grace countdown — the pty stays alive until the user switches
+	* back (a reconnecting view's `open()` clears this) or explicitly closes
+	* the tab (a `{type:'close'}` frame's `scheduleClose` clears this).
+	*/
+	park(key) {
+		if (this.sessions.get(key) === void 0) return;
+		this.cancelClose(key);
+		this.parked.add(key);
+	}
+	/** Whether this pty was parked (its view unmounted for a session switch). */
+	isParked(key) {
+		return this.parked.has(key);
+	}
+	/** Cancel a pending scheduled close (the terminal is being reopened).
+	*  Also clears the parked state — a reconnecting view reattaches a parked
+	*  pty and resumes normal lifecycle. */
 	cancelClose(key) {
 		const timer = this.pendingCloses.get(key);
 		if (timer !== void 0) {
 			clearTimeout(timer);
 			this.pendingCloses.delete(key);
 		}
+		this.parked.delete(key);
 	}
 	/** Resolve a live handle by key, or undefined. */
 	get(key) {
@@ -867,18 +1377,68 @@ var PtyManager = class {
 	}
 };
 /**
-* The interactive shell for this platform, resolved like a terminal
-* emulator: an explicit `$SHELL` on the dsh process wins (deployment
-* override), then the account's login shell from passwd, then `/bin/bash`.
-* The passwd step matters because service managers and container inits
-* often start dsh without `SHELL`, and the tab should still open the
-* user's login shell (e.g. zsh) instead of silently degrading to bash.
-* Windows short-circuits to `powershell.exe` before any resolution.
+* Candidate directories that may contain a `pwsh.exe` on Windows: PATH
+* entries first, then the well-known machine/user install locations
+* (including preview channels and per-user MSI/portable layouts). The
+* machine-scope search reads both `ProgramW6432` and `ProgramFiles` so a
+* 32-bit Node process — whose `ProgramFiles` points at `(x86)` — still
+* finds a 64-bit PowerShell 7 install. De-duped while preserving priority
+* order.
 */
-function defaultShell() {
-	if (process.platform === "win32") return "powershell.exe";
-	const envShell = process.env.SHELL;
-	if (envShell !== void 0 && envShell.trim() !== "") return envShell;
+function windowsPwshCandidateDirs(env) {
+	const dirs = [];
+	const pathEntries = env.PATH;
+	if (pathEntries !== void 0) for (const entry of pathEntries.split(";")) {
+		const trimmed = entry.trim();
+		if (trimmed !== "") dirs.push(trimmed);
+	}
+	for (const programFiles of [env.ProgramW6432, env.ProgramFiles]) {
+		if (programFiles === void 0 || programFiles.trim() === "") continue;
+		dirs.push(join(programFiles, "PowerShell", "7"));
+		dirs.push(join(programFiles, "PowerShell", "7-preview"));
+	}
+	const localAppData = env.LOCALAPPDATA;
+	if (localAppData !== void 0 && localAppData.trim() !== "") {
+		dirs.push(join(localAppData, "Microsoft", "PowerShell", "7"));
+		dirs.push(join(localAppData, "Microsoft", "PowerShell", "7-preview"));
+		dirs.push(join(localAppData, "Programs", "PowerShell", "7"));
+		dirs.push(join(localAppData, "Programs", "PowerShell", "7-preview"));
+	}
+	return [...new Set(dirs)];
+}
+/**
+* The interactive shell for this platform, resolved like a terminal
+* emulator: an explicitly configured shell (the `shell` config field) wins,
+* then `$SHELL` on POSIX (deployment override), then the account's login
+* shell from passwd, then `/bin/bash`. The passwd step matters because
+* service managers and container inits often start dsh without `SHELL`, and
+* the tab should still open the user's login shell (e.g. zsh) instead of
+* silently degrading to bash.
+*
+* Windows previously short-circuited to `powershell.exe` (the inbox 5.1)
+* before any resolution, so PowerShell 7 users always got a legacy shell
+* without `??`/`?.`/ternary and with poor ANSI/UTF-8 defaults. The Windows
+* chain is now: explicit shell → `DSH_SIDEBAR_SHELL` env override → first
+* `pwsh.exe` found on PATH or in a known install directory → the 5.1
+* fallback (machines without PowerShell 7 keep working).
+*/
+function defaultShell(options = {}) {
+	const platform = options.platform ?? process.platform;
+	const env = options.env ?? process.env;
+	const exists = options.exists ?? existsSync;
+	const explicit = options.explicit;
+	if (explicit !== void 0 && explicit.trim() !== "") return explicit.trim();
+	if (platform === "win32") {
+		const envShell = env.DSH_SIDEBAR_SHELL;
+		if (envShell !== void 0 && envShell.trim() !== "") return envShell.trim();
+		for (const dir of windowsPwshCandidateDirs(env)) {
+			const candidate = join(dir, "pwsh.exe");
+			if (exists(candidate)) return candidate;
+		}
+		return "powershell.exe";
+	}
+	const envShell = env.SHELL;
+	if (envShell !== void 0 && envShell.trim() !== "") return envShell.trim();
 	try {
 		const loginShell = userInfo().shell;
 		if (typeof loginShell === "string" && loginShell.trim() !== "") return loginShell;
@@ -886,11 +1446,26 @@ function defaultShell() {
 	return "/bin/bash";
 }
 /**
+* A short display name for a shell executable, used as the terminal tab
+* title. `/bin/zsh` → `zsh`, `C:\...\powershell.exe` → `powershell`.
+* Falls back to the raw value when no basename can be derived.
+*/
+function shellDisplayName(shell) {
+	const normalized = shell.replace(/\\/g, "/");
+	const base = normalized.slice(normalized.lastIndexOf("/") + 1);
+	if (base === "") return shell;
+	return base.replace(/\.(exe|cmd|bat)$/i, "");
+}
+/**
 * Spawn arguments that make the shell behave like a terminal-emulator tab:
 * POSIX shells start as login shells (`-l`) so they read the profile files
 * (`~/.profile`, `~/.zprofile`); Windows PowerShell takes no login flag.
+*
+* When explicit `configured` args are supplied they REPLACE the platform
+* defaults entirely, giving deployments full control over shell startup.
 */
-function shellSpawnArgs() {
+function shellSpawnArgs(configured = []) {
+	if (configured.length > 0) return [...configured];
 	return process.platform === "win32" ? [] : ["-l"];
 }
 //#endregion
@@ -988,10 +1563,14 @@ function snapshotOf(handle) {
 */
 var AgentPtyRegistry = class {
 	shell;
+	shellArgs;
+	nodePty;
 	sessions = /* @__PURE__ */ new Map();
 	changeListeners = /* @__PURE__ */ new Set();
-	constructor(shell) {
+	constructor(shell, shellArgs = [], nodePty = loadRequiredNodePty()) {
 		this.shell = shell;
+		this.shellArgs = shellArgs;
+		this.nodePty = nodePty;
 		ensureSpawnHelper();
 	}
 	/**
@@ -1002,10 +1581,10 @@ var AgentPtyRegistry = class {
 	* user closes the sidebar tab. An empty `command` spawns a bare shell.
 	* @returns the new handle's uuid (the model-facing opaque id).
 	*/
-	create(sessionId, title, command, cwd, cols = 80, rows = 24) {
+	create(sessionId, title, command, cwd, cols = 80, rows = 24, shell, shellArgs) {
 		const uuid = randomUUID();
 		const dims = clampDims(cols, rows);
-		const pty = nodePty.spawn(this.shell, shellSpawnArgs(), {
+		const pty = this.nodePty.spawn(shell ?? this.shell, shellSpawnArgs(shellArgs ?? this.shellArgs), {
 			name: "xterm-256color",
 			cols: dims.cols,
 			rows: dims.rows,
@@ -1324,7 +1903,7 @@ function sessionIdOf(exec) {
 * @returns a disposer that unregisters all eight tools (the caller gates
 * registration on the side-card setting and calls this to turn them off).
 */
-function registerTools(ctx, registry, resolveCwd) {
+function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 	const disposers = [];
 	const register = (tool) => {
 		disposers.push(ctx.tools.register(tool));
@@ -1367,7 +1946,8 @@ function registerTools(ctx, registry, resolveCwd) {
 			exec.signal.throwIfAborted();
 			const sessionId = sessionIdOf(exec);
 			const cwd = resolveCwd(sessionId);
-			const uuid = registry.create(sessionId, args.title, args.command, cwd, 80, 24);
+			const { shell, shellArgs } = readShellOverrides();
+			const uuid = registry.create(sessionId, args.title, args.command, cwd, 80, 24, shell, shellArgs);
 			return Promise.resolve({
 				uuid,
 				title: args.title
@@ -1987,6 +2567,622 @@ function buildJobsApi(ctx, outputLimit) {
 	};
 }
 //#endregion
+//#region src/sidechat-core.ts
+/** The durable thread-label prefix (also the row filter in the client list). */
+const SIDE_LABEL_PREFIX = "Side: ";
+/** The pinned label of a freshly created thread that no prompt has reached
+*  yet (Codex-style immediate create: the tab opens an EMPTY thread, the
+*  first composer message carries the boundary and earns the real label).
+*  The client renders it localized; the prefix keeps the row filter honest. */
+const SIDE_NEW_THREAD_TITLE = "Side: New thread";
+/** The plugin identity stamped on the source of context-injection messages
+*  (boundary prompt + parked snapshot), so the transcript recognizes them
+*  structurally — not by text prefix. */
+const SIDE_INJECTION_PLUGIN = "dsh-better-sidebar";
+/**
+* The boundary prompt delivered as the thread's first user message: the
+* inherited seed is reference context only, never active instruction.
+* Model-facing contract — change only with intent, tests pin the sentences.
+*/
+const SIDE_BOUNDARY_PROMPT = `Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent session: its completed turns, its pending question, and — if the parent was mid-turn — its in-progress output frozen at the moment this side conversation started. It is reference context only. It is not your current task.
+
+Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages submitted after this boundary are active user instructions for this side conversation.
+
+Mode: this is a continuable side conversation. Your answers stay in this side thread and are viewed in the side panel; they are never delivered into the parent session.`;
+/** The data record of one event (narrowed from the loose face). */
+function dataOf(event) {
+	return event.data;
+}
+/** Copy parent events verbatim (their live seq === array index contract).
+*  The FULL envelope is preserved — stripping `surfaceOp` would make the
+*  seed validator reject every surface-eligible message event. */
+function copyEvents(events) {
+	return events.map((event) => {
+		const source = event;
+		return {
+			type: source.type,
+			seq: source.seq,
+			time: source.time,
+			data: dataOf(source),
+			...source.surfaceOp === void 0 ? {} : { surfaceOp: source.surfaceOp },
+			...source.sourceEventSeqs === void 0 ? {} : { sourceEventSeqs: source.sourceEventSeqs },
+			...source.ignorable === void 0 ? {} : { ignorable: source.ignorable }
+		};
+	});
+}
+/** Index of the last `turn/start` or `turn/end`, or -1. */
+function lastTurnBoundary(events) {
+	for (let index = events.length - 1; index >= 0; index--) {
+		const type = events[index]?.type;
+		if (type === "turn/start" || type === "turn/end") return index;
+	}
+	return -1;
+}
+/** Numeric field of an event's data (turn / step numbers). */
+function numberAt(data, key) {
+	const value = data[key];
+	return typeof value === "number" && Number.isSafeInteger(value) ? value : 0;
+}
+/** The step number still open at the log tail inside the turn starting at
+*  `turnStart` (undefined when no step is open). */
+function openStepInTurn(events, turnStart) {
+	let open;
+	for (let index = turnStart + 1; index < events.length; index++) {
+		const event = events[index];
+		if (event === void 0) continue;
+		if (event.type === "step/start") open = numberAt(dataOf(event), "step");
+		else if (event.type === "step/end") open = void 0;
+	}
+	return open;
+}
+/**
+* Whether the open turn ending the log has a `tool/call` without its paired
+* `tool/result` in the CURRENT open step. Providers reject dangling
+* assistant calls, so such a turn cannot be honestly closed and the
+* inheritance must fall back to the snapshot.
+*/
+function hasDanglingToolCall(events, turnStart) {
+	const pending = /* @__PURE__ */ new Set();
+	for (let index = turnStart + 1; index < events.length; index++) {
+		const event = events[index];
+		if (event === void 0) continue;
+		const data = dataOf(event);
+		if (event.type === "step/end") {
+			pending.clear();
+			continue;
+		}
+		if (event.type === "tool/call") {
+			const callId = data.callId;
+			if (typeof callId === "string") pending.add(callId);
+			continue;
+		}
+		if (event.type === "tool/result") {
+			const callId = data.message?.source?.callId;
+			if (typeof callId === "string") pending.delete(callId);
+		}
+	}
+	return pending.size > 0;
+}
+/** The plain text of one tool/result message (text blocks inside its
+*  `tool-result` content block). */
+function toolResultText(data) {
+	const content = data.message?.content;
+	if (!Array.isArray(content)) return "";
+	const parts = [];
+	for (const block of content) {
+		if (block === null || typeof block !== "object") continue;
+		const candidate = block;
+		if (candidate.type !== "tool-result") continue;
+		const inner = candidate.content;
+		if (!Array.isArray(inner)) continue;
+		for (const item of inner) {
+			if (item === null || typeof item !== "object") continue;
+			const textItem = item;
+			if (textItem.type === "text" && typeof textItem.text === "string") parts.push(textItem.text);
+		}
+	}
+	return parts.join("\n");
+}
+/** Cap applied to one tool-result's text inside a snapshot (prompt budget). */
+const SNAPSHOT_RESULT_CAP = 2e3;
+/** Cap applied to the whole snapshot (prompt budget). */
+const SNAPSHOT_TOTAL_CAP = 8e3;
+/**
+* Build the side-thread inheritance for one parent log: the full event log
+* up to the click moment, honestly closed when it ends inside an open turn.
+*/
+function buildSidechatInheritance(events) {
+	if (events.length === 0) return {
+		seed: [],
+		snapshot: null
+	};
+	const boundary = lastTurnBoundary(events);
+	if (boundary < 0 || events[boundary]?.type === "turn/end") return {
+		seed: copyEvents(events),
+		snapshot: null
+	};
+	if (hasDanglingToolCall(events, boundary)) return {
+		seed: copyEvents(events.slice(0, boundary)),
+		snapshot: buildOpenTurnSnapshot(events)
+	};
+	const seed = copyEvents(events);
+	const last = events[events.length - 1];
+	const turn = numberAt(dataOf(events[boundary]), "turn");
+	const now = last?.time ?? 0;
+	const openStep = openStepInTurn(events, boundary);
+	if (openStep !== void 0) seed.push({
+		type: "step/end",
+		seq: seed.length,
+		time: now,
+		data: {
+			turn,
+			step: openStep
+		}
+	});
+	seed.push({
+		type: "turn/end",
+		seq: seed.length,
+		time: now,
+		data: {
+			turn,
+			reason: { kind: "interrupted" }
+		}
+	});
+	return {
+		seed,
+		snapshot: null
+	};
+}
+/**
+* Structured text snapshot of the parent's OPEN turn (from its `turn/start`
+* to the log tail): the accumulated assistant/reasoning output verbatim
+* (code blocks ride the raw deltas) and the tool activity — executed tools
+* with their result text, the still-executing one marked. Returns null when
+* there is no open turn or nothing to show.
+*/
+function buildOpenTurnSnapshot(events) {
+	const boundary = lastTurnBoundary(events);
+	if (boundary < 0 || events[boundary]?.type !== "turn/start") return null;
+	let text = "";
+	let reasoning = "";
+	const tools = [];
+	const pendingCalls = /* @__PURE__ */ new Map();
+	let total = 0;
+	for (let index = boundary + 1; index < events.length; index++) {
+		const event = events[index];
+		if (event === void 0) continue;
+		const data = dataOf(event);
+		if (event.type === "step/end") {
+			pendingCalls.clear();
+			continue;
+		}
+		if (event.type === "assistant/chunk") {
+			const chunk = data.chunk;
+			if (chunk === null || typeof chunk !== "object") continue;
+			if (chunk.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
+			else if (chunk.type === "reasoning-delta" && typeof chunk.text === "string") reasoning += chunk.text;
+			continue;
+		}
+		if (event.type === "tool/call") {
+			const callId = data.callId;
+			if (typeof callId === "string") pendingCalls.set(callId, {
+				name: typeof data.name === "string" ? data.name : "tool",
+				args: typeof data.arguments === "string" ? data.arguments : ""
+			});
+			continue;
+		}
+		if (event.type === "tool/result") {
+			const source = data.message;
+			const callId = typeof source?.source?.callId === "string" ? source.source.callId : void 0;
+			const name = callId !== void 0 ? pendingCalls.get(callId)?.name : void 0;
+			const args = callId !== void 0 ? pendingCalls.get(callId)?.args : void 0;
+			if (callId !== void 0) pendingCalls.delete(callId);
+			const result = toolResultText(data).slice(0, SNAPSHOT_RESULT_CAP);
+			const failed = data.error !== void 0;
+			const line = [`- \`${name ?? "tool"}\`${failed ? " (failed)" : ""}` + (args !== void 0 && args !== "" ? ` — arguments: \`${args}\`` : ""), ...result === "" ? [] : [`  Result: ${result}`]].join("\n");
+			tools.push(line);
+			total += line.length;
+		}
+	}
+	for (const [, call] of pendingCalls) {
+		const line = `- \`${call.name}\` (executing) — arguments: \`${call.args}\``;
+		tools.push(line);
+		total += line.length;
+	}
+	const sections = [];
+	if (text.trim() !== "") sections.push(`Assistant output so far:\n\n${text}`);
+	if (reasoning.trim() !== "") sections.push(`Reasoning so far:\n\n${reasoning}`);
+	if (tools.length > 0) sections.push(`Tool activity:\n${tools.join("\n")}`);
+	if (sections.length === 0) return null;
+	const body = sections.join("\n\n");
+	return body.length > SNAPSHOT_TOTAL_CAP ? `Parent session in-progress turn (reference only):\n\n${body.slice(0, SNAPSHOT_TOTAL_CAP)}…` : `Parent session in-progress turn (reference only):\n\n${body}`;
+}
+/** Truncate + prefix a question into a durable thread label. */
+function sideLabel(question) {
+	const flat = question.replace(/\s+/g, " ").trim();
+	const max = Math.max(1, 42);
+	const body = flat.length > max ? `${flat.slice(0, 41)}…` : flat;
+	return `${SIDE_LABEL_PREFIX}${body}`;
+}
+/**
+* Whether the thread log already carries the side boundary message — i.e.
+* the first prompt was delivered. Tolerant to the content shape (block
+* array or bare string) and to inherited seed messages (only an OWN
+* boundary message starts with the prefix; seed messages came from the
+* parent's log, which never contains one).
+*/
+function boundaryDelivered(events) {
+	for (const event of events) {
+		if (event.type !== "user/message") continue;
+		if (messageLeadText(dataOf(event)).startsWith("Side conversation boundary")) return true;
+	}
+	return false;
+}
+/** The leading text of a user/message's content (block array or bare string). */
+function messageLeadText(data) {
+	const content = data.content;
+	const first = Array.isArray(content) ? content[0] : content;
+	return typeof first === "string" ? first : typeof first === "object" && first !== null && "text" in first ? String(first.text) : "";
+}
+/**
+* The agent preset a session actually runs: newest `agent-preset/selected`
+* event wins, else the creation header (mirror of the dsh-agent-presets
+* resolveSessionPreset helper — replicated here to avoid a host dependency
+* on that package).
+*/
+function resolvePresetId(header, events) {
+	for (let index = events.length - 1; index >= 0; index--) {
+		const event = events[index];
+		if (event?.type !== "agent-preset/selected") continue;
+		const preset = dataOf(event).agentPreset;
+		if (typeof preset === "string") return preset;
+	}
+	return header.agentPreset;
+}
+//#endregion
+//#region src/subagent-activity.ts
+/**
+* Extract the concatenated plain text of a content-block list (the durable
+* `ContentBlock[]` shape, structurally: blocks with `type: 'text'` carry
+* `text`; anything else — tool_use, image, … — contributes nothing).
+* @param content - the raw `content` field of a message event.
+* @returns the joined text, or undefined when the message carries no text.
+*/
+function contentText(content) {
+	if (!Array.isArray(content)) return void 0;
+	const parts = [];
+	for (const block of content) {
+		if (block === null || typeof block !== "object") continue;
+		const candidate = block;
+		if (candidate.type === "text" && typeof candidate.text === "string") parts.push(candidate.text);
+	}
+	return parts.length > 0 ? parts.join("\n") : void 0;
+}
+/**
+* Fold a session event log into the last text output + last tool call (each
+* is the LAST occurrence in event order). Lifecycle events and raw
+* `assistant/chunk` rows are ignored — the card shows what the subagent is
+* doing right now, not its plumbing. The scan runs BACKWARD from the newest
+* event and stops once both fields are found, so a long history costs only
+* the recent tail in the common case.
+* @param events - the session's append-only event log (oldest → newest).
+* @param maxMessages - optional message-boundary window: only the tail's
+*   last `maxMessages` surface messages (`user/message`, `assistant/message`)
+*   and the events between them are considered, mirroring the old
+*   `subagents.history({ maxMessages })` window. Stale activity older than
+*   the window is never surfaced, and a long log is never scanned in full.
+* @returns the last text and/or tool call; an empty object when the log has neither.
+*/
+function lastActivity(events, maxMessages = Infinity) {
+	let text;
+	let tool;
+	let messagesSeen = 0;
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		if (text !== void 0 && tool !== void 0) break;
+		const event = events[index];
+		if (event === void 0) continue;
+		const { type, data } = event;
+		if (type === "user/message" || type === "assistant/message") {
+			messagesSeen += 1;
+			if (messagesSeen > maxMessages) break;
+		} else if (messagesSeen >= maxMessages) continue;
+		if (text === void 0 && type === "assistant/message") {
+			const message = data.message;
+			const extracted = contentText(message?.content);
+			if (extracted !== void 0) text = extracted;
+		} else if (tool === void 0 && type === "tool/call") tool = {
+			name: typeof data.name === "string" ? data.name : "tool",
+			args: typeof data.arguments === "string" ? data.arguments : ""
+		};
+	}
+	if (text === void 0 && tool === void 0) return {};
+	return {
+		...text === void 0 ? {} : { text },
+		...tool === void 0 ? {} : { tool }
+	};
+}
+/**
+* Build the live-preview routes bound to the plugin context.
+* @param ctx - host plugin context.
+*/
+function buildSubagentLiveApi(ctx) {
+	return { async live(payload) {
+		const rootSessionId = requireString(payload, "rootSessionId");
+		const subagents = ctx.get("subagents");
+		if (subagents === void 0 || typeof subagents.listDescendants !== "function") throw new SidebarError("subagents-unavailable", "the subagent service is not mounted in this deployment", 503);
+		let descendants;
+		try {
+			descendants = await subagents.listDescendants(rootSessionId);
+		} catch (error) {
+			throw new SidebarError("subagents-unavailable", `subagent catalog read failed: ${error instanceof Error ? error.message : String(error)}`, 503);
+		}
+		const live = {};
+		for (const entry of descendants) {
+			if (entry.kind !== "child" || entry.activity !== "running") continue;
+			if (entry.label?.startsWith("Side: ") ?? false) continue;
+			try {
+				const activity = lastActivity(ctx.sessions.get(entry.id)?.events ?? [], 12);
+				if (activity.text !== void 0 || activity.tool !== void 0) live[entry.id] = activity;
+			} catch {}
+		}
+		return { live };
+	} };
+}
+//#endregion
+//#region src/sidechat-routes.ts
+/**
+* Side Chat routes of the /sidebar JSON API ('sidechat.start' /
+* 'sidechat.prompt' / 'sidechat.cancel' / 'sidechat.dispose').
+*
+* A side thread is a child session the plugin creates ITSELF with a custom
+* seed — the parent's full event log up to the click moment, honestly closed
+* at an in-progress turn (see sidechat-core.ts). The child is marked
+* `origin: 'subagent'` so the main session list hides it, and EVERY
+* operation goes through these routes because the generic session RPCs are
+* fenced away from subagent-origin identities (the api-remotes
+* agent-lookup ownership fence). No DSH source is touched:
+*
+* - creation uses the public AgentRegistry.create seam (the same one
+*   api-proxy's session.fork and the subagent fork provider use), with the
+*   parent's preset composition and provider/model selection so the child's
+*   first request shares the parent's token prefix (provider-side prefix
+*   cache reuse);
+* - the first prompt (boundary + question) and every follow-up are admitted
+*   with the stock `agent.followup`;
+* - a cold thread (DSH restart, or a closed thread) is resumed with
+*   AgentRegistry.resume, composing the preset the child recorded.
+*/
+/** Timeout guarding the create call (the registry detaches it before the
+*  handle becomes visible, so the child is never cancelled by it). */
+const CREATE_TIMEOUT_MS = 15e3;
+/** Per-activation disposers of created thread agents (the dispose route
+*  releases them; the session and its history always stay persisted). */
+const threadDisposers = /* @__PURE__ */ new Map();
+/** The in-progress-turn snapshot captured at creation of an EMPTY thread,
+*  waiting to ride the first prompt (lost on a host restart — the boundary
+*  prompt is then delivered alone, a logged degradation). */
+const pendingSnapshots = /* @__PURE__ */ new Map();
+/** Resolve the parent's preset and build the child's composition setup
+*  (mirror of api-proxy's composeAgent minus the model-selection install —
+*  the child carries the parent's provider/model in agentOptions). */
+async function composeChildSetup(ctx, presetId) {
+	const presets = ctx.get("agentPresets");
+	if (presets === void 0) return { setup: () => Promise.resolve() };
+	const resolved = await presets.resolve(presetId);
+	return {
+		agentPreset: resolved.id,
+		setup: async (agentCtx) => {
+			await presets.mount(agentCtx, resolved.id);
+		}
+	};
+}
+/** Build the cold-resume setup from the thread's PERSISTED record (the
+*  recorded preset wins, newest selection event first). */
+async function composePersistedSetup(ctx, childId) {
+	const persistence = ctx.get("sessionPersistence");
+	if (persistence === void 0) return () => Promise.resolve();
+	const inspected = await persistence.inspect(childId);
+	const presetId = resolvePresetId(inspected.meta, inspected.events);
+	const presets = ctx.get("agentPresets");
+	if (presets === void 0 || presetId === void 0) return () => Promise.resolve();
+	const resolved = await presets.resolve(presetId);
+	return async (agentCtx) => {
+		await presets.mount(agentCtx, resolved.id);
+	};
+}
+/** One text-block prompt (the thread boundary + question, or a follow-up). */
+function textPrompt(text) {
+	return [{
+		type: "text",
+		text
+	}];
+}
+/** Admit one user message to a live agent through the stock followup path. */
+function admitFollowup(agent, blocks) {
+	const message = createUserMessage({
+		content: blocks,
+		source: { kind: "user" }
+	});
+	agent.followup(message);
+}
+/**
+* Deliver the thread's FIRST contact as TWO log-separated messages: the
+* boundary prompt (+ the parked in-progress snapshot) rides `agent.inject`
+* — queued model-facing context that does NOT wake the driver and is
+* claimed FIRST at the opening step (Inbox.claim drains next-step before
+* next-turn) — and the user's question is the follow-up that wakes it. The
+* log therefore records two user/message events (injection, then question)
+* instead of one wrapped blob: the transcript shows the question as a user
+* bubble and collapses the injection as a context row. The injection source
+* is stamped `kind: 'plugin'` so recognition is structural; its text still
+* opens with SIDE_BOUNDARY_PREFIX, keeping boundaryDelivered intact.
+*/
+function admitFirstContact(agent, injectionText, question) {
+	agent.inject(createUserMessage({
+		content: textPrompt(injectionText),
+		source: {
+			kind: "plugin",
+			plugin: SIDE_INJECTION_PLUGIN
+		}
+	}));
+	admitFollowup(agent, textPrompt(question));
+}
+/** The live thread agent, or undefined (cold — the caller resumes). */
+function liveThreadAgent(ctx, childId) {
+	return ctx.get("agents")?.get(childId);
+}
+/** Build the Side Chat routes (all optional services degrade to a wire
+*  error the tab surfaces inline). The record keys are the FULL wire method
+*  names the /sidebar/api dispatcher looks up (`api[method]`). */
+function buildSidechatApi(ctx) {
+	return {
+		"sidechat.start": async (payload) => {
+			const sessionId = requireString(payload, "sessionId");
+			const rawQuestion = payload.question;
+			const question = typeof rawQuestion === "string" ? rawQuestion.trim() : "";
+			const parent = liveThreadAgent(ctx, sessionId);
+			if (parent === void 0) throw new SidebarError("sidechat-error", `parent session "${sessionId}" is not running`, 409);
+			const parentSession = parent.session;
+			const inheritance = buildSidechatInheritance(parentSession.events);
+			const { agentPreset, setup } = await composeChildSetup(ctx, resolvePresetId(parentSession.header, parentSession.events));
+			const childId = `session-${randomUUID()}`;
+			const label = question === "" ? SIDE_NEW_THREAD_TITLE : sideLabel(question);
+			const descriptor = snapshotSubagentDescriptor({
+				mode: "continuable",
+				provider: "sidechat",
+				label,
+				...parent.options.provider === void 0 ? {} : { agentProvider: parent.options.provider },
+				...parent.options.model === void 0 ? {} : { agentModel: parent.options.model }
+			});
+			const descriptorEvent = {
+				type: "subagent/descriptor",
+				seq: inheritance.seed.length,
+				time: Date.now(),
+				data: descriptor
+			};
+			const seed = [...inheritance.seed, descriptorEvent];
+			const options = {
+				sessionId: childId,
+				meta: {
+					...parentSession.header.cwd === void 0 ? {} : { cwd: parentSession.header.cwd },
+					parentSession: parentSession.id,
+					seedLength: seed.length,
+					origin: "subagent",
+					delegationDepth: (parentSession.header.delegationDepth ?? 0) + 1,
+					...agentPreset === void 0 ? {} : { agentPreset }
+				},
+				seed,
+				agentOptions: { ...parent.options },
+				setup,
+				signal: AbortSignal.timeout(CREATE_TIMEOUT_MS)
+			};
+			const agents = ctx.get("agents");
+			if (agents?.create === void 0) throw new SidebarError("sidechat-error", "the agents service is unavailable", 503);
+			let handle;
+			try {
+				handle = await agents.create(options);
+			} catch (error) {
+				throw new SidebarError("sidechat-error", `thread creation failed: ${error instanceof Error ? error.message : String(error)}`, 500);
+			}
+			threadDisposers.set(childId, () => handle.dispose());
+			const titles = ctx.get("sessionTitle");
+			const pinTitle = (label) => {
+				if (titles === void 0) return;
+				try {
+					titles.rename(handle.agent.session, label);
+				} catch {}
+			};
+			if (question === "") {
+				if (inheritance.snapshot !== null) pendingSnapshots.set(childId, inheritance.snapshot);
+				pinTitle(SIDE_NEW_THREAD_TITLE);
+			} else {
+				const promptParts = [SIDE_BOUNDARY_PROMPT];
+				if (inheritance.snapshot !== null) promptParts.push(inheritance.snapshot);
+				admitFirstContact(handle.agent, promptParts.join("\n\n"), question);
+				pinTitle(sideLabel(question));
+			}
+			return { childId };
+		},
+		"sidechat.prompt": async (payload) => {
+			const childId = requireString(payload, "childId");
+			const text = requireString(payload, "text").trim();
+			if (text === "") throw new SidebarError("bad-request", "text is required");
+			let agent = liveThreadAgent(ctx, childId);
+			if (agent === void 0) {
+				const agents = ctx.get("agents");
+				if (agents?.resume === void 0) throw new SidebarError("sidechat-error", "the agents service is unavailable", 503);
+				const setup = await composePersistedSetup(ctx, childId);
+				try {
+					const handle = await agents.resume({
+						resumeSessionId: childId,
+						setup
+					});
+					threadDisposers.set(childId, () => handle.dispose());
+					agent = handle.agent;
+				} catch (error) {
+					throw new SidebarError("sidechat-error", `thread resume failed: ${error instanceof Error ? error.message : String(error)}`, 500);
+				}
+			}
+			if (boundaryDelivered(agent.session.events)) admitFollowup(agent, textPrompt(text));
+			else {
+				const parts = [SIDE_BOUNDARY_PROMPT];
+				const snapshot = pendingSnapshots.get(childId);
+				pendingSnapshots.delete(childId);
+				if (snapshot !== void 0) parts.push(snapshot);
+				admitFirstContact(agent, parts.join("\n\n"), text);
+				const titles = ctx.get("sessionTitle");
+				if (titles !== void 0) try {
+					titles.rename(agent.session, sideLabel(text));
+				} catch {}
+			}
+			return { accepted: true };
+		},
+		"sidechat.cancel": async (payload) => {
+			const agent = liveThreadAgent(ctx, requireString(payload, "childId"));
+			if (agent !== void 0) agent.cancel({ kind: "user" }, { keepInbox: true });
+			return { accepted: true };
+		},
+		"sidechat.dispose": async (payload) => {
+			const childId = requireString(payload, "childId");
+			pendingSnapshots.delete(childId);
+			const dispose = threadDisposers.get(childId);
+			if (dispose !== void 0) {
+				threadDisposers.delete(childId);
+				try {
+					await dispose();
+				} catch {}
+			}
+			return { accepted: true };
+		},
+		"sidechat.info": async (payload) => {
+			const childId = requireString(payload, "childId");
+			const agent = liveThreadAgent(ctx, childId);
+			if (agent !== void 0) {
+				const preset = agent.session.header.agentPreset;
+				return {
+					live: true,
+					status: agent.status,
+					...agent.options.provider === void 0 ? {} : { provider: agent.options.provider },
+					...agent.options.model === void 0 ? {} : { model: agent.options.model },
+					...preset === void 0 ? {} : { preset }
+				};
+			}
+			const persistence = ctx.get("sessionPersistence");
+			if (persistence !== void 0) try {
+				const inspected = await persistence.inspect(childId);
+				const preset = resolvePresetId(inspected.meta, inspected.events);
+				return {
+					live: false,
+					...preset === void 0 ? {} : { preset }
+				};
+			} catch {}
+			return { live: false };
+		}
+	};
+}
+//#endregion
 //#region src/index.ts
 /**
 * dsh-better-sidebar host half: the /sidebar JSON API (explorer listing, file
@@ -2095,8 +3291,26 @@ async function readText(path, readLimit) {
 		await handle.close();
 	}
 }
-/** Build the API method table bound to the plugin context, pty manager, agent pty registry, and resolved config. */
-function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
+/** Build the API method table bound to the plugin context, pty manager, agent pty registry, resolved config, and effective terminal shell. */
+/**
+* Resolve the settings-page terminal shell overrides (the terminal card's
+* gear rows). Empty fields mean "unset": keep the yaml `config.shell` /
+* `shellArgs` (or the platform auto-resolution). The settings page is the
+* runtime complement to the boot-time yaml — same contract, later binding:
+* the values here win for terminals opened afterwards.
+*/
+function shellOverridesOf(getSettings) {
+	const value = getSettings()?.get().value;
+	if (value === null || typeof value !== "object") return {};
+	const record = value;
+	const shell = typeof record.terminalShell === "string" ? record.terminalShell.trim() : "";
+	const args = typeof record.terminalShellArgs === "string" ? record.terminalShellArgs.trim() : "";
+	return {
+		shell: shell === "" ? void 0 : shell,
+		shellArgs: args === "" ? void 0 : args.split(/\s+/).filter(Boolean)
+	};
+}
+function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, getSettings) {
 	const cwdOf = (payload) => {
 		const sessionId = requireString(payload, "sessionId");
 		const record = payload;
@@ -2106,6 +3320,7 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
 		};
 	};
 	const jobsApi = buildJobsApi(ctx, resolved.readLimit);
+	const subagentLiveApi = buildSubagentLiveApi(ctx);
 	return {
 		"session.cwd": (payload) => {
 			const { sessionId, cwd } = cwdOf(payload);
@@ -2119,6 +3334,10 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
 		"fs.tree": async (payload) => {
 			const { cwd } = cwdOf(payload);
 			return listDirectory(payload.path === void 0 ? cwd : requireAbsolute(requireString(payload, "path")), resolved.listLimit);
+		},
+		"fs.search": async (payload) => {
+			const { cwd } = cwdOf(payload);
+			return searchFiles(cwd, requireString(payload, "query"));
 		},
 		"fs.read": async (payload) => {
 			const { cwd } = cwdOf(payload);
@@ -2215,20 +3434,31 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
 		"pty.close": (payload) => {
 			const sessionId = requireString(payload, "sessionId");
 			const tab = requireString(payload, "tab");
-			ptyManager.close(`${sessionId}:${tab}`);
+			ptyManager?.close(`${sessionId}:${tab}`);
 			return { ok: true };
 		},
 		"agent-pty.close": (payload) => {
 			const uuid = requireString(payload, "uuid");
-			agentPtyRegistry.close(uuid);
+			agentPtyRegistry?.close(uuid);
 			return { ok: true };
 		},
+		"terminal.deps": () => depsStatus(),
 		"jobs.output": (payload) => jobsApi.output(payload),
 		"jobs.kill": (payload) => jobsApi.kill(payload),
+		"subagents.live": (payload) => subagentLiveApi.live(payload),
+		"shell.get": () => ({
+			shell: terminalShell,
+			name: shellDisplayName(terminalShell)
+		}),
 		"settings.get": () => {
-			return getSettings()?.get() ?? {
+			const settings = getSettings();
+			return settings === void 0 ? {
 				value: void 0,
-				revision: void 0
+				revision: void 0,
+				externalDisable: false
+			} : {
+				...settings.get(),
+				externalDisable: settings.externalDisable()
 			};
 		},
 		"settings.update": async (payload) => {
@@ -2282,7 +3512,14 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
 			} finally {
 				clearTimeout(timer);
 			}
-		}
+		},
+		"open.external": (payload) => {
+			const action = payload?.action;
+			if (action === "reveal") return launchExternal("reveal", requireString(payload, "path"));
+			if (action === "url") return launchExternal("url", requireString(payload, "url"));
+			throw new SidebarError("bad-request", "action must be \"reveal\" or \"url\"");
+		},
+		...buildSidechatApi(ctx)
 	};
 }
 /**
@@ -2295,18 +3532,28 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
 function apply(ctx, config) {
 	ensureSpawnHelper();
 	const resolved = resolveSidebarConfig(config);
+	const terminalShell = defaultShell({ explicit: resolved.shell });
 	const fence = (req) => isTrustedApiRequest(req, ctx.webRuntime.trustedHosts);
-	const ptyManager = new PtyManager(defaultShell(), resolved.terminalsPerSession);
-	const agentPtyRegistry = new AgentPtyRegistry(defaultShell());
+	const nodePty = loadNodePty();
+	if (nodePty === null) {
+		const status = depsStatus();
+		const detail = status.ok ? "unknown cause" : `${status.cause}. Repair: ${status.command}`;
+		ctx.logger?.warn(`[dsh-better-sidebar] node-pty (${DSH_NODE_PTY_RANGE}) failed to load: ${detail}`);
+	}
+	const ptyManager = nodePty !== null ? new PtyManager(terminalShell, resolved.terminalsPerSession, resolved.shellArgs, nodePty) : null;
+	const agentPtyRegistry = nodePty !== null ? new AgentPtyRegistry(terminalShell, resolved.shellArgs, nodePty) : null;
 	let settingsFace;
 	let toolsDisposers = null;
 	const syncToolsGate = (scope) => {
 		if (scope.get().agentTerminalTools) {
-			if (toolsDisposers === null) toolsDisposers = registerTools(ctx, agentPtyRegistry, (sessionId) => sessionCwdOf(ctx, sessionId));
+			if (toolsDisposers === null) {
+				if (agentPtyRegistry === null) return;
+				toolsDisposers = registerTools(ctx, agentPtyRegistry, (sessionId) => sessionCwdOf(ctx, sessionId), () => shellOverridesOf(() => settingsFace));
+			}
 		} else if (toolsDisposers !== null) {
 			toolsDisposers();
 			toolsDisposers = null;
-			agentPtyRegistry.disposeAll();
+			agentPtyRegistry?.disposeAll();
 		}
 	};
 	ctx.inject(["settings"], (sctx) => {
@@ -2322,8 +3569,12 @@ function apply(ctx, config) {
 				revision: descriptor.revision
 			};
 		};
+		const externalDisable = () => {
+			return (sctx.settings.describe({ redactSecrets: true }).find((candidate) => candidate.ns === "aionui-panel")?.value)?.rightPanel === "aionui-panel";
+		};
 		settingsFace = {
 			get: viewOf,
+			externalDisable,
 			update: async (patch, expectedRevision) => {
 				await sctx.settings.update(ns, patch, expectedRevision);
 				return viewOf();
@@ -2334,7 +3585,7 @@ function apply(ctx, config) {
 			syncToolsGate(scope);
 		});
 	});
-	const api = buildApi(ctx, ptyManager, agentPtyRegistry, resolved, () => settingsFace);
+	const api = buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, () => settingsFace);
 	ctx.effect(() => ctx.webServer.register({
 		kind: "prefix",
 		path: "/sidebar/api",
@@ -2375,6 +3626,52 @@ function apply(ctx, config) {
 			}
 		}
 	}), "dsh-better-sidebar: /sidebar/api routes");
+	ctx.effect(() => ctx.webServer.register({
+		kind: "exact",
+		path: "/sidebar/upload",
+		handler: async (req, res) => {
+			if (!fence(req)) {
+				writeJson(res, 403, {
+					ok: false,
+					error: {
+						code: "forbidden",
+						message: "forbidden"
+					}
+				});
+				return;
+			}
+			if (req.method !== "POST") {
+				writeJson(res, 405, {
+					ok: false,
+					error: {
+						code: "method-error",
+						message: "method not allowed"
+					}
+				});
+				return;
+			}
+			try {
+				const url = new URL(req.url ?? "/", "http://dsh.internal");
+				const sessionId = url.searchParams.get("sessionId");
+				const dir = url.searchParams.get("dir");
+				const relativePath = url.searchParams.get("relativePath");
+				if (sessionId === null || dir === null || relativePath === null || relativePath.trim() === "") throw new SidebarError("bad-request", "sessionId, dir, and relativePath are required");
+				const { path, size } = await writeWorkspaceUpload({
+					cwd: sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0),
+					dir,
+					relativePath,
+					chunks: req,
+					limit: resolved.uploadLimit
+				});
+				writeOk(res, {
+					path,
+					size
+				});
+			} catch (error) {
+				writeError(res, error);
+			}
+		}
+	}), "dsh-better-sidebar: /sidebar/upload route");
 	ctx.effect(() => registerBundleRoute(ctx, fence), "dsh-better-sidebar: /sidebar/bundle chunk route");
 	ctx.effect(() => ctx.webServer.register({
 		kind: "prefix",
@@ -2464,7 +3761,7 @@ function apply(ctx, config) {
 				return;
 			}
 			wss.handleUpgrade(req, socket, head, (ws) => {
-				attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolved);
+				attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolved, () => settingsFace);
 			});
 		}
 	}), "dsh-better-sidebar: terminal WebSocket");
@@ -2483,8 +3780,8 @@ function apply(ctx, config) {
 	}), "dsh-better-sidebar: agent-terminals push WebSocket");
 	ctx.effect(() => () => {
 		toolsDisposers?.();
-		ptyManager.disposeAll();
-		agentPtyRegistry.disposeAll();
+		ptyManager?.disposeAll();
+		agentPtyRegistry?.disposeAll();
 		wss.close();
 		agentListWss.close();
 	}, "dsh-better-sidebar: teardown");
@@ -2498,15 +3795,15 @@ async function attachAgentList(registry, ws, req) {
 			return;
 		}
 		const send = () => {
-			if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(registry.list(sessionId)));
+			if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(registry?.list(sessionId) ?? []));
 		};
 		send();
-		const unsubscribe = registry.subscribe(send);
+		const unsubscribe = registry?.subscribe(send);
 		ws.on("close", () => {
-			unsubscribe();
+			unsubscribe?.();
 		});
 		ws.on("error", () => {
-			unsubscribe();
+			unsubscribe?.();
 		});
 	} catch (error) {
 		ws.close(1011, error instanceof Error ? error.message : String(error));
@@ -2523,12 +3820,20 @@ async function attachAgentList(registry, ws, req) {
 * - `?tab=...&sessionId=...` attaches to a UI-tab terminal (the user
 *   created it from the + menu). The close frame schedules a 0-ms close
 *   (the host's reconnect grace keeps the shell alive across a refresh).
+*   The park frame (sent when the user switches to another conversation)
+*   marks the pty as parked so the upcoming bare socket drop does NOT start
+*   the grace countdown — the tab is still open in its session's state, so
+*   the shell must survive until the user switches back or closes the tab.
 */
-async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolved) {
+async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolved, getSettings) {
 	try {
 		const url = new URL(req.url ?? "/", "http://dsh.internal");
 		const uuid = url.searchParams.get("uuid");
 		if (uuid !== null) {
+			if (agentPtyRegistry === null) {
+				ws.close(1011, `agent terminal "${uuid}" not found`);
+				return;
+			}
 			const handle = agentPtyRegistry.get(uuid);
 			if (handle === void 0) {
 				ws.close(1011, `agent terminal "${uuid}" not found`);
@@ -2543,8 +3848,13 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 			ws.close(1008, "either ?uuid or ?sessionId+?tab are required");
 			return;
 		}
+		if (ptyManager === null) {
+			ws.close(1011, PTY_DEPS_MISSING);
+			return;
+		}
 		const cwd = sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0);
-		const handle = ptyManager.open(sessionId, tabId, cwd, 80, 24);
+		const overrides = shellOverridesOf(getSettings);
+		const handle = ptyManager.open(sessionId, tabId, cwd, 80, 24, overrides.shell, overrides.shellArgs);
 		if (handle.transcript !== "") ws.send(handle.transcript);
 		const onData = (data) => {
 			if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 4194304) ws.send(data);
@@ -2565,6 +3875,10 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 				ptyManager.scheduleClose(handle.key, 0);
 				return;
 			}
+			if (control !== null && control.type === "park") {
+				ptyManager.park(handle.key);
+				return;
+			}
 			if (handle.exited) return;
 			if (control !== null && control.type === "resize" && typeof control.cols === "number" && typeof control.rows === "number") {
 				const dims = clampDims(control.cols, control.rows);
@@ -2574,7 +3888,7 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 		ws.on("close", () => {
 			dataSub.dispose();
 			exitSub.dispose();
-			ptyManager.scheduleClose(handle.key, resolved.reconnectGraceMs);
+			if (!ptyManager.isParked(handle.key)) ptyManager.scheduleClose(handle.key, resolved.reconnectGraceMs);
 		});
 	} catch (error) {
 		ws.close(1011, error instanceof Error ? error.message : String(error));

@@ -13,8 +13,8 @@ import { SIDEBAR_PREFS_DEFAULTS, type SidebarPrefs } from '../prefs-shared.ts'
 import { isNarrowWidth } from './breakpoints.ts'
 
 /**
- * Tab type identifier. Builtins register their ids (explorer / git / editor
- * / terminal / subagent / diff) through the sidebar service; external
+ * Tab type identifier. Builtins register their ids (editor / git / terminal
+ * / subagent / browser / diff) through the sidebar service; external
  * plugins register their own (e.g. `'my-plugin:db'`). Kept as `string` so
  * the registry stays open.
  */
@@ -25,7 +25,7 @@ export type SidebarDiffRef =
   | { kind: 'worktree'; path: string; staged: boolean; untracked?: boolean }
   | { kind: 'commit'; hash: string; hashFull: string; subject: string }
 
-/** One open tab. `path` carries the file (editor) or is absent (explorer/git);
+/** One open tab. `path` carries the file (editor) or is absent (git/terminal);
  *  `diff` carries the change a diff tab shows; `meta` (v0.12.0+) carries
  *  plugin-owned JSON-serializable state, preserved across reloads. */
 export interface SidebarTab {
@@ -105,6 +105,13 @@ function uid(prefix: string): string {
   return `${prefix}:${nextIdCounter}`
 }
 
+/** Mint a fresh uid-based tab id. The `'editor:' + path` convention only
+ *  covers openSidebarFile opens (per-path dedupe); opens that must not
+ *  dedupe (the tree's "open to the side") mint through here. */
+export function mintTabId(): string {
+  return uid('tab')
+}
+
 /**
  * The largest numeric suffix across a raw persisted state's counter ids
  * (`pane:N` / `tab:N` / `split:N`). The uid counter is module-global and
@@ -139,17 +146,24 @@ function maxCounterId(parsed: unknown): number {
   return max
 }
 
-/** A fresh default state: one explorer tab in one pane, open per the caller's
+/** The default tab a fresh session seeds. */
+export type DefaultSeed = 'editor-home' | 'none'
+
+/** A fresh default state: one seeded tab in one pane, open per the caller's
  * preference. `width` is the caller's preferred panel width (default
  * PANEL_DEFAULT) and `panelOpen` whether the panel starts expanded (default
  * true); the store seeds new sessions from the user's side card prefs.
- * `seedExplorer` places the default explorer tab — the store passes false
- * when the user disabled the explorer tab type in settings, so a fresh
- * session starts with an empty pane instead of a tab they turned off. */
-export function makeDefaultState(width = PANEL_DEFAULT, panelOpen = true, seedExplorer = true): SidebarState {
+ * `seed` picks the seeded tab: 'editor-home' places the EMPTY files window
+ * (an editor tab with no path whose tree panel starts open,
+ * `meta.treeOpen: true`) — in BOTH editorExplorer modes that window is the
+ * file explorer page — and 'none' starts with an empty pane (the store
+ * passes it when the user disabled the editor tab type in settings). */
+export function makeDefaultState(width = PANEL_DEFAULT, panelOpen = true, seed: DefaultSeed = 'editor-home'): SidebarState {
   const leaf: SidebarLeaf = { kind: 'leaf', id: uid('pane'), tabs: [], active: null }
-  if (seedExplorer) {
-    leaf.tabs = [{ id: uid('tab'), type: 'explorer', title: 'Explorer' }]
+  if (seed === 'editor-home') {
+    // No path: the editor host renders its empty-state hint and the docked
+    // tree panel (treeOpen defaults open for path-less tabs; meta pins it).
+    leaf.tabs = [{ id: uid('tab'), type: 'editor', title: 'Files', meta: { treeOpen: true } }]
     leaf.active = leaf.tabs[0]!.id
   }
   // The bottom panel starts closed with an empty pane (its welcome cards
@@ -764,19 +778,21 @@ function loadState(sessionId: string, prefs: SidebarPrefs): SidebarState {
   // New sessions seed from the user's side card prefs: the width is the
   // chosen percent of the window (clamped to the panel floor and the
   // viewport so a huge percent can never crush the app shell), the panel
-  // starts open only when the preference says so, and the default explorer
-  // tab is skipped when the user disabled the explorer tab type. On a
-  // NARROW viewport a brand-new session starts collapsed instead — the
-  // panel is a full-screen drawer there, and auto-opening it on first
-  // paint would cover the conversation before the user asked. Only the
-  // first seeding is affected: once the user expands the drawer,
-  // `panelOpen: true` persists like any other state.
+  // starts open only when the preference says so, and the seed tab is the
+  // empty files window (tree panel open) in BOTH editorExplorer modes — a
+  // disabled editor type seeds nothing. On a NARROW viewport a brand-new
+  // session starts collapsed instead — the panel is a full-screen drawer
+  // there, and auto-opening it on first paint would cover the conversation
+  // before the user asked. Only the first seeding is affected: once the
+  // user expands the drawer, `panelOpen: true` persists like any other
+  // state.
   const viewport = typeof window !== 'undefined' ? window.innerWidth : undefined
   const width = viewport === undefined
     ? PANEL_DEFAULT
     : defaultWidthFor(viewport, prefs.defaultWidthPercent)
   const openByDefault = prefs.openByDefault && (viewport === undefined || !isNarrowWidth(viewport))
-  return makeDefaultState(width, openByDefault, prefs.tabsEnabled['explorer'] !== false)
+  const seed: DefaultSeed = prefs.tabsEnabled['editor'] === false ? 'none' : 'editor-home'
+  return makeDefaultState(width, openByDefault, seed)
 }
 
 /**
@@ -809,8 +825,9 @@ export function sanitizeState(parsed: unknown): SidebarState | undefined {
   // bottom tree.
   const seen = new Set<string>()
   const reid = new Map<string, string>()
-  const splits = sanitizeNode(record.splits, seen, reid)
-  if (splits === undefined) return undefined
+  const restoredSplits = sanitizeNode(record.splits, seen, reid)
+  if (restoredSplits === undefined) return undefined
+  const splits = pruneEmptyPanes(restoredSplits)
   // Bottom-panel fields arrived in a later build: a missing or malformed
   // value on an OLDER persisted state defaults (closed / default height /
   // empty pane) so existing layouts keep loading, like nextBrowser.
@@ -824,15 +841,23 @@ export function sanitizeState(parsed: unknown): SidebarState | undefined {
     ? record.bottomHeight
     : BOTTOM_DEFAULT
   const bottomHeight = Math.min(bottomCap, Math.max(BOTTOM_MIN, Math.round(rawHeight)))
-  const bottomSplits = sanitizeNode(record.bottomSplits, seen, reid)
-    ?? { kind: 'leaf' as const, id: uid('pane'), tabs: [], active: null }
+  const bottomSplits = pruneEmptyPanes(sanitizeNode(record.bottomSplits, seen, reid)
+    ?? { kind: 'leaf' as const, id: uid('pane'), tabs: [], active: null })
+  const requestedActivePane = typeof record.activePane === 'string'
+    ? (reid.get(record.activePane) ?? record.activePane)
+    : null
+  const activePane = requestedActivePane === null
+    ? null
+    : treeHasId(splits, requestedActivePane) || treeHasId(bottomSplits, requestedActivePane)
+      ? requestedActivePane
+      : firstLeaf(splits).id
   const maxWidth = typeof window !== 'undefined' ? window.innerWidth : Infinity
   return {
     panelOpen: record.panelOpen,
     width: Math.max(PANEL_MIN, Math.min(record.width, maxWidth)),
     // A stale duplicate pane id may have been re-ided; follow the rename so
     // new tabs still land in the pane the user was using.
-    activePane: typeof record.activePane === 'string' ? (reid.get(record.activePane) ?? record.activePane) : null,
+    activePane,
     nextTerminal: record.nextTerminal,
     nextBrowser,
     expanded: record.expanded as string[],
@@ -845,6 +870,16 @@ export function sanitizeState(parsed: unknown): SidebarState | undefined {
     bottomOpenedOnce: record.bottomOpenedOnce === true,
     bottomSplits,
   }
+}
+
+/** Collapse persisted split panes left empty after ephemeral diff tabs are dropped. */
+function pruneEmptyPanes(node: SplitNode): SplitNode {
+  const leaves = allLeaves(node)
+  if (!leaves.some(leaf => leaf.tabs.length > 0)) return node
+  return leaves.reduce(
+    (tree, leaf) => leaf.tabs.length === 0 ? removeLeafAt(tree, leaf.id) : tree,
+    node,
+  )
 }
 
 /**
@@ -891,6 +926,21 @@ function sanitizeNode(node: unknown, seen: Set<string>, reid: Map<string, string
       // accept any string type here — an unregistered type renders an
       // <OrphanedTab/> at view time and recovers if its plugin loads later.
       if (typeof candidate.type !== 'string') return undefined
+      // The standalone explorer tab type merged INTO the editor (the single
+      // files window): a persisted explorer tab reopens as an editor home
+      // tab — no path, tree panel open (an existing meta object survives).
+      if (candidate.type === 'explorer') {
+        const meta = candidate.meta !== null && typeof candidate.meta === 'object' && !Array.isArray(candidate.meta)
+          ? candidate.meta as Record<string, unknown>
+          : undefined
+        tabs.push({
+          id: candidate.id,
+          type: 'editor',
+          title: 'Files',
+          meta: { treeOpen: true, ...meta },
+        })
+        continue
+      }
       // `meta` is plugin-owned JSON-serializable state (v0.12.0+): the
       // persisted value already went through JSON.parse, so it is inherently
       // serializable — carry it through verbatim (absent on older states).
@@ -943,6 +993,26 @@ export class SidebarStore {
   private readonly persistTimers = new Map<string, number>()
   /** User-facing side card prefs seeding brand-new session states (defaults until the settings RPC resolves). */
   private prefs: SidebarPrefs = { ...SIDEBAR_PREFS_DEFAULTS }
+  /**
+   * External disable (the dsh-web-ui family's aionui-panel provider choice):
+   * while true the sidebar must not mount at all. Not part of the snapshot —
+   * nothing renders on it; the mount gate and the intercept predicates read
+   * it directly.
+   */
+  private suspended = false
+
+  /**
+   * Set the external-disable flag (from the settings route) and remember it
+   * for the mount gate and the intercept predicates.
+   */
+  setSuspended(suspended: boolean): void {
+    this.suspended = suspended
+  }
+
+  /** Whether the sidebar is externally disabled (aionui-panel chosen). */
+  getSuspended(): boolean {
+    return this.suspended
+  }
 
   /**
    * Replace the side card prefs (the settings RPC result / settings page
