@@ -85,7 +85,7 @@ if exist "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs" (
 echo [Dsh_BatStart] starting DSH web on port %PORT%
 set "SERVER_LOG=%SCRIPT_DIR%\dsh-server.log"
 if exist "%SERVER_LOG%" del "%SERVER_LOG%"
-start "DSH Web" cmd /c ""%NODE_EXE%" "%DSH_BIN%" web --port %PORT% > "%SERVER_LOG%" 2>&1"
+start "DSH Web" cmd /c ""%NODE_EXE%" "%DSH_BIN%" web --no-open --port %PORT% > "%SERVER_LOG%" 2>&1"
 
 :: 6) wait, then self-check the port and open browser
 echo [Dsh_BatStart] waiting for server to start
