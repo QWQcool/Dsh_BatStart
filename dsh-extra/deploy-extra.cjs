@@ -30,7 +30,7 @@ const PATCH_FILE = path.join(PROFILE_WEB, "cordis.patch.yml");
 const SETTINGS_FILE = path.join(DSH_HOME, "settings.yaml");
 const { viewVersion, viewVersionFrom, registryUrl, npmInstall } = require("./npm-registry.cjs");
 const TRIVIUM_PKG = "dsh-trivium";
-const TRIVIUM_FALLBACK = "0.4.13";
+const TRIVIUM_FALLBACK = "0.4.14";
 let TRIVIUM_VERSION = TRIVIUM_FALLBACK;
 const PATCH_HEAD = `# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; \`!!js\` expressions allowed).\n`;
 
