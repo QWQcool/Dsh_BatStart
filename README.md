@@ -71,7 +71,7 @@ node "<仓库>\node_modules\@deepseek-ai\dsh\lib\bin.js" web --port 3090
 
 ## 自带：跨会话记忆
 
-启动时安装 [dsh-trivium](https://www.npmjs.com/package/dsh-trivium)（跟 npm latest，回退 **0.4.10**）。本机若有 `Desktop/dsh-trivium` 源码则 **junction** 过去，并把 `dsh-llm` / `dsh-tools` 接到宿主那一份，避免双份 instanceof 对不上。没有该文件夹的用户只走 npm。每个工作区一个 `.dsh/trivium.tdb`。设置里会出现「Trivium 记忆」，标题栏「对话 / 轨迹」旁会出现「会话图」（可手切「生成检查点」）。
+启动时安装 [dsh-trivium](https://www.npmjs.com/package/dsh-trivium)（跟 npm latest，回退 **0.4.13**）。本机若有 `Desktop/dsh-trivium` 源码则 **junction** 过去，并把 `dsh-llm` / `dsh-tools` 接到宿主那一份，避免双份 instanceof 对不上。没有该文件夹的用户只走 npm。每个工作区一个 `.dsh/trivium.tdb`。设置里会出现「Trivium 记忆」，标题栏「对话 / 轨迹」旁会出现「会话图」（可手切「生成检查点」）。
 
 识图、侧边栏是可选的；记忆插件会默认装上。
 
