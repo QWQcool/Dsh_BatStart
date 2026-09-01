@@ -6,6 +6,8 @@ export declare function FileTree(props: {
     sessionId: string;
     cwd: string | undefined;
     expanded: string[];
+    /** Files highlighted by a "Show in folder" reveal (absolute paths). */
+    revealed: string[];
     onToggle: (path: string) => void;
     onOpenFile: (path: string) => void;
     /** Context-menu "open in a new tab" (file rows; absent → no entry). */

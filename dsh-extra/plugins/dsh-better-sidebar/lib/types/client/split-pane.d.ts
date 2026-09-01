@@ -13,6 +13,14 @@ export interface WorkbenchActions {
     /** Reorder within a pane (drop onto another tab inserts before it). */
     moveTabBefore: (payload: TabDragPayload, toPane: string, beforeTabId: string) => void;
     resizeSplit: (splitId: string, index: number, deltaFrac: number) => void;
+    /** Float a docked tab out as a free window (tab context menu entry). */
+    floatTab: (tabId: string) => void;
+    /**
+     * Pin/unpin a terminal tab (v0.17.0+). The shell snapshots the home cwd
+     * at pin time; null clears the pin. Optional: when undefined the tab
+     * context menu hides the pin entry (legacy callers).
+     */
+    pinTab?: (tabId: string, scope: 'workspace' | 'global' | null) => void;
 }
 /** The workbench: the split tree filling the sidebar body. `tree` selects
  *  which tree renders (the right panel's by default; the bottom panel passes

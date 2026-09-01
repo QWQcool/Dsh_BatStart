@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { mkdir, open, opendir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, opendir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import z from "schemastery";
@@ -23,6 +23,37 @@ import { snapshotSubagentDescriptor } from "@deepseek-ai/dsh-subagent";
 */
 /** The user-settings namespace holding the side card preferences. */
 const SIDEBAR_PREFS_NS = "dsh-better-sidebar";
+/** Fallback prefs used whenever the settings document is unreachable or malformed. */
+const SIDEBAR_PREFS_DEFAULTS = {
+	openByDefault: false,
+	defaultWidthPercent: 35,
+	autoOpenSubagent: true,
+	autoOpenJobs: true,
+	agentTerminalTools: false,
+	agentOpenTools: false,
+	bottomPanelAutoTerminal: true,
+	terminalFontFamily: "",
+	terminalFontSize: 13,
+	interceptOpenPath: true,
+	editorExplorer: false,
+	terminalShell: "",
+	terminalShellArgs: "",
+	titleBarScheme: "auto",
+	titleBarPresetId: "",
+	customCss: "",
+	titleBarCompat: false,
+	titleBarStripPx: 40,
+	htmlViewerNoSandbox: false,
+	htmlViewerDefaultUnsafe: false,
+	browserNoSandbox: false,
+	browserInterceptLinks: true,
+	browserInterceptHttp: true,
+	browserInterceptHttps: false,
+	browserAllowedLoopback: "",
+	tabsEnabled: {},
+	viewersEnabled: {},
+	pluginSettings: {}
+};
 //#endregion
 //#region src/config.ts
 /**
@@ -67,6 +98,7 @@ const PrefsSchema = z.object({
 	autoOpenSubagent: z.boolean().default(true),
 	autoOpenJobs: z.boolean().default(true),
 	agentTerminalTools: z.boolean().default(false),
+	agentOpenTools: z.boolean().default(false),
 	bottomPanelAutoTerminal: z.boolean().default(true),
 	terminalFontFamily: z.string().default(""),
 	terminalFontSize: z.number().step(1).min(9).max(32).default(13),
@@ -90,6 +122,7 @@ const PrefsSchema = z.object({
 	browserInterceptLinks: z.boolean().default(true),
 	browserInterceptHttp: z.boolean().default(true),
 	browserInterceptHttps: z.boolean().default(false),
+	browserAllowedLoopback: z.string().default(""),
 	tabsEnabled: z.dict(z.boolean()).default({}),
 	viewersEnabled: z.dict(z.boolean()).default({}),
 	pluginSettings: z.dict(z.dict(z.any())).default({})
@@ -288,17 +321,75 @@ function messageOf(error) {
 	return error instanceof Error ? error.message : String(error);
 }
 //#endregion
+//#region src/path-security.ts
+/** Filesystem path guards shared by sidebar APIs that access a session workspace. */
+/** Resolve a path and convert filesystem resolution failures to an API error. */
+async function resolveRealPath(path, label) {
+	try {
+		return await realpath(path);
+	} catch (error) {
+		throw new SidebarError("fs-error", `cannot resolve ${label} "${path}": ${error instanceof Error ? error.message : String(error)}`, 400);
+	}
+}
+/** Reject a resolved path whose real filesystem target escapes the workspace. */
+function assertWithinWorkspace(workspace, target) {
+	if (!isWithin(workspace, target)) throw new SidebarError("forbidden", `path "${target}" is outside workspace`, 403);
+}
+/**
+* Resolve an existing workspace path through symlinks and enforce containment.
+*
+* @param cwd - Session workspace directory.
+* @param target - Client-supplied absolute path.
+* @returns The canonical absolute path used for the filesystem operation.
+*/
+async function ensureWorkspacePath(cwd, target) {
+	const absolute = requireAbsolute(target);
+	const [realCwd, realTarget] = await Promise.all([resolveRealPath(cwd, "workspace"), resolveRealPath(absolute, "target")]);
+	assertWithinWorkspace(realCwd, realTarget);
+	return realTarget;
+}
+/**
+* Validate a write destination, including destinations that do not exist yet.
+* Existing targets are resolved to catch symlinks; missing targets are checked
+* against the nearest existing ancestor before the caller creates or renames.
+* The returned path is rebuilt from that canonical ancestor, so an existing
+* symlink is never left in the path passed to the write operation.
+*
+* @param cwd - Session workspace directory.
+* @param target - Client-supplied absolute destination path.
+* @returns A canonical path for an existing target or its nearest existing ancestor.
+*/
+async function ensureWorkspaceWritePath(cwd, target) {
+	const absolute = requireAbsolute(target);
+	const realCwd = await resolveRealPath(cwd, "workspace");
+	let existingPath = absolute;
+	const missingSegments = [];
+	for (;;) try {
+		const realTarget = await realpath(existingPath);
+		assertWithinWorkspace(realCwd, realTarget);
+		return missingSegments.reduce((path, segment) => join(path, segment), realTarget);
+	} catch (error) {
+		if (error.code !== "ENOENT") {
+			if (error instanceof SidebarError) throw error;
+			throw new SidebarError("fs-error", `cannot resolve target "${existingPath}": ${error instanceof Error ? error.message : String(error)}`, 400);
+		}
+		const parent = dirname(existingPath);
+		if (parent === existingPath) throw new SidebarError("fs-error", `cannot resolve target "${absolute}"`, 400);
+		missingSegments.unshift(basename(existingPath));
+		existingPath = parent;
+	}
+}
+//#endregion
 //#region src/fs-operations.ts
 /**
 * Workspace-safe file mutations for the sidebar (the upload route today).
 *
-* Every write is lexically confined to the session workspace: the upload
-* directory is resolved absolute and must sit inside the session cwd, the
-* relative path is sanitized (absolute paths, '.', '..' and empty segments
-* are refused), and the final target must stay inside both. Containment is
-* lexical (no symlink resolution) — a symlinked directory inside the cwd can
-* redirect writes outside, matching the trust model of the other /sidebar/*
-* routes. Bytes stream from the request body to a uniquely named temp sibling
+* Every write is confined to the real session workspace: the upload
+* directory is resolved absolute and its target is checked through existing
+* filesystem ancestors, the relative path is sanitized (absolute paths, '.',
+* '..' and empty segments are refused), and the final target must stay inside
+* the workspace after symlink resolution. Bytes stream from the request body
+* to a uniquely named temp sibling
 * and are renamed into place, so a failed, aborted, or oversized upload never
 * leaves a partial file at the target path.
 */
@@ -316,14 +407,14 @@ function messageOf(error) {
 async function writeWorkspaceUpload(input) {
 	const { cwd, dir, relativePath, chunks, limit } = input;
 	const base = requireAbsolute(dir);
-	if (!isWithin(cwd, base)) throw new SidebarError("forbidden", "upload directory escapes the session workspace", 403);
+	await ensureWorkspacePath(cwd, base);
 	if (relativePath === "" || relativePath.startsWith("/") || relativePath.startsWith("\\")) throw new SidebarError("bad-request", "relativePath must stay below the upload directory", 400);
 	const segments = relativePath.split(/[\\/]/);
 	if (segments.some((part) => part === "" || part === "." || part === "..")) throw new SidebarError("bad-request", "relativePath must stay below the upload directory", 400);
 	const target = join(base, ...segments);
-	if (!isWithin(cwd, target) || !isWithin(base, target)) throw new SidebarError("forbidden", "target escapes the session workspace", 403);
-	const tmp = join(dirname(target), `.${basename(target)}.dsh-upload-${randomUUID()}.tmp`);
-	await mkdir(dirname(target), { recursive: true });
+	const safeTarget = await ensureWorkspaceWritePath(cwd, target);
+	const tmp = join(dirname(safeTarget), `.${basename(safeTarget)}.dsh-upload-${randomUUID()}.tmp`);
+	await mkdir(dirname(safeTarget), { recursive: true });
 	const stream = createWriteStream(tmp, { flags: "wx" });
 	const closed = new Promise((resolve) => {
 		stream.once("close", () => resolve());
@@ -345,10 +436,10 @@ async function writeWorkspaceUpload(input) {
 			stream.end((error) => error === void 0 || error === null ? resolve() : reject(error));
 		});
 		if (streamError !== void 0) throw streamError;
-		await rename(tmp, target);
+		await rename(tmp, safeTarget);
 		return {
 			path: target,
-			size: (await stat(target)).size
+			size: (await stat(safeTarget)).size
 		};
 	} catch (error) {
 		stream.destroy();
@@ -364,17 +455,43 @@ async function writeWorkspaceUpload(input) {
 * Streams the tree with opendir and matches the query as a case-insensitive
 * substring of each entry's NAME (paths stay relative to the search root —
 * the client resolves them against the session cwd). No .gitignore semantics
-* (this is a name lookup, not a code search), but `.git` directories are
-* skipped outright (VCS internals are never useful results) and symlink
-* directories are NOT descended (cycle safety).
+* (this is a name lookup, not a code search), but known noise directories
+* (`.git`, `node_modules`, package-manager stores, build caches) are
+* skipped outright and symlink directories are NOT descended (cycle safety).
 *
 * Two performance budgets bound the walk: `maxMatches` (the client renders
-* the flat list) and `maxVisited` (a runaway tree — a home directory root,
-* a node_modules forest — must not stall the host). Exceeding either stops
-* early with `truncated: true`.
+* the flat list) and `maxVisited` (a runaway tree — a home directory root
+* — must not stall the host). Exceeding either stops early with
+* `truncated: true`.
 */
 const DEFAULT_MAX_MATCHES = 200;
 const DEFAULT_MAX_VISITED = 1e5;
+/**
+* Directory names that are never useful filename-search results and would
+* burn the visit budget before the walk reaches project files. Compared
+* case-insensitively so `Node_Modules` / `.GIT` stay skipped on every
+* platform. The directory itself is neither matched nor descended.
+*/
+const SEARCH_SKIP_DIRS = /* @__PURE__ */ new Set([
+	".git",
+	"node_modules",
+	".pnpm-store",
+	".yarn",
+	".turbo",
+	".turbopack",
+	".next",
+	".nuxt",
+	".output",
+	".cache",
+	".parcel-cache",
+	"coverage",
+	"dist",
+	"build",
+	"out",
+	".umi",
+	".umi-production",
+	".dumi"
+]);
 /**
 * Search `root` recursively for entries whose name contains `query`
 * (case-insensitive).
@@ -406,7 +523,7 @@ async function searchFiles(root, query, opts = {}) {
 				truncated = true;
 				return;
 			}
-			if (dirent.isDirectory() && dirent.name === ".git") continue;
+			if (dirent.isDirectory() && SEARCH_SKIP_DIRS.has(dirent.name.toLowerCase())) continue;
 			if (dirent.name.toLowerCase().includes(needle)) {
 				matches.push(join(relative(root, dir), dirent.name));
 				if (matches.length >= maxMatches) {
@@ -430,7 +547,7 @@ async function searchFiles(root, query, opts = {}) {
 * Decode a route pathname into the session + absolute file path. Rejects
 * a wrong prefix (404), an empty path, malformed percent encoding, and a
 * missing sessionId or file path (400). The caller still must bound the
-* decoded path with requireAbsolute + isWithin(cwd) — a decoded `..`
+* decoded path with the workspace real-path guard — a decoded `..`
 * segment resolves outside the cwd and is refused there.
 */
 function decodeHtmlUrl(pathname) {
@@ -555,7 +672,7 @@ function isTrustedApiRequest(request, trustedHosts) {
 	const origin = header(request.headers, "origin");
 	if (origin === void 0) return true;
 	try {
-		return new URL(origin).host === hostUrl.host;
+		return new URL(origin).hostname === hostUrl.hostname;
 	} catch {
 		return false;
 	}
@@ -793,6 +910,36 @@ function parsePorcelainZ(output) {
 	}
 	return entries;
 }
+/** Parse `git worktree list --porcelain` records. Production requests use
+* `-z` so even newlines and non-ASCII bytes in checkout paths stay lossless;
+* newline framing remains accepted for small fixtures and older Git output. */
+function parseWorktreeList(output) {
+	const rows = [];
+	let path;
+	let branch = "HEAD";
+	let locked = false;
+	let prunable = false;
+	const flush = () => {
+		if (path !== void 0) rows.push({
+			path,
+			branch,
+			locked,
+			prunable
+		});
+		path = void 0;
+		branch = "HEAD";
+		locked = false;
+		prunable = false;
+	};
+	const sep = output.includes("\0") ? "\0" : "\n";
+	const framed = output.endsWith(sep) ? output : `${output}${sep}`;
+	for (const line of framed.split(sep)) if (line === "") flush();
+	else if (line.startsWith("worktree ")) path = line.slice(9);
+	else if (line.startsWith("branch refs/heads/")) branch = line.slice(18);
+	else if (line === "locked" || line.startsWith("locked ")) locked = true;
+	else if (line === "prunable" || line.startsWith("prunable ")) prunable = true;
+	return rows;
+}
 /** Parse `git log --pretty=format:%h%x1f%s%x1f%an%x1f%ai%x1f%H%x1f%D` rows. */
 function parseLogLines(output) {
 	const rows = [];
@@ -857,17 +1004,79 @@ function runGit(cwd, args, timeoutMs = 3e4) {
 		});
 	});
 }
-/** Whether the directory is inside a git work tree (exit-0 `git rev-parse`). */
+/** Cap on child directories probed by the workspace-container fallback scan.
+*  A home-directory cwd can hold hundreds of visible folders (Library, iCloud
+*  mounts…); probing them all serially is what froze the panel in #369. */
+const DISCOVERY_LIMIT = 200;
+/** Per-probe and direct-discovery budget. `rev-parse` is millisecond-scale on
+*  a healthy checkout; a probe that needs longer is a stalled mount and is
+*  better abandoned than waited on. */
+const DISCOVERY_TIMEOUT_MS = 5e3;
+/** Discovery results are cheap to recompute but expensive to storm: the panel
+*  polls every 2s and each poll fans out into several git.* calls that all
+*  resolve the same roots. A short TTL keeps fan-out at one scan per cwd. */
+const DISCOVERY_CACHE_TTL_MS = 6e4;
+const repoRootsCache = /* @__PURE__ */ new Map();
+const repoRootsInFlight = /* @__PURE__ */ new Map();
+/** Whether the directory is inside a git work tree (exit-0 `git rev-parse`).
+*  Probe timeout is short: a cwd on a stalled mount must not hold the panel
+*  hostage for the full command budget (issue #369). */
 async function isGitRepo(cwd) {
 	try {
-		return (await runGit(cwd, ["rev-parse", "--is-inside-work-tree"])).trim() === "true";
+		return (await runGit(cwd, ["rev-parse", "--is-inside-work-tree"], DISCOVERY_TIMEOUT_MS)).trim() === "true";
 	} catch {
 		return false;
 	}
 }
 /** The repository top level containing `cwd` (`git rev-parse --show-toplevel`). */
-async function repoRoot(cwd) {
-	return (await runGit(cwd, ["rev-parse", "--show-toplevel"])).trim();
+async function directRepoRoot(cwd) {
+	return (await runGit(cwd, ["rev-parse", "--show-toplevel"], DISCOVERY_TIMEOUT_MS)).trim();
+}
+/** Discover the current repository or direct child repositories. Results are
+*  cached per cwd and concurrent callers share one in-flight scan, so opening
+*  the panel (three parallel git.* requests) costs a single discovery pass. */
+function repoRoots(cwd) {
+	const cached = repoRootsCache.get(cwd);
+	if (cached !== void 0 && cached.expires > Date.now()) return Promise.resolve(cached.roots);
+	const pending = repoRootsInFlight.get(cwd);
+	if (pending !== void 0) return pending;
+	const promise = discoverRepoRoots(cwd).then((roots) => {
+		repoRootsCache.set(cwd, {
+			roots,
+			expires: Date.now() + DISCOVERY_CACHE_TTL_MS
+		});
+		repoRootsInFlight.delete(cwd);
+		return roots;
+	}, (error) => {
+		repoRootsInFlight.delete(cwd);
+		throw error;
+	});
+	repoRootsInFlight.set(cwd, promise);
+	return promise;
+}
+async function discoverRepoRoots(cwd) {
+	try {
+		return [await directRepoRoot(cwd)];
+	} catch {
+		const entries = await readdir(cwd, { withFileTypes: true }).catch(() => []);
+		const roots = [];
+		for (const entry of entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules").sort((left, right) => left.name.localeCompare(right.name)).slice(0, DISCOVERY_LIMIT)) try {
+			const root = await directRepoRoot(join(cwd, entry.name));
+			if (!roots.some((existing) => pathIdentity(existing) === pathIdentity(root))) roots.push(root);
+		} catch {}
+		return roots;
+	}
+}
+/** Resolve the selected repository, defaulting to the first discovered root. */
+async function repoRoot(cwd, selected) {
+	const roots = await repoRoots(cwd);
+	if (roots.length === 0) throw new GitCommandError("not a git repository", "not-repo", "rev-parse");
+	if (selected !== void 0) {
+		const identity = pathIdentity(selected);
+		const match = roots.find((root) => pathIdentity(root) === identity);
+		if (match !== void 0) return match;
+	}
+	return roots[0];
 }
 /** The current branch name (`git rev-parse --abbrev-ref HEAD`; 'HEAD' when detached). */
 async function currentBranch(cwd) {
@@ -877,33 +1086,84 @@ async function currentBranch(cwd) {
 		"HEAD"
 	])).trim();
 }
+/** Upper bound on status rows shipped to the client. Beyond this the result
+*  is truncated (with `truncated: true`) so a pathological untracked set —
+*  e.g. the working tree discovered under a home-directory cwd — cannot
+*  freeze the browser main thread on JSON parse or list render (#369). */
+const GIT_STATUS_LIMIT = 2e3;
 /**
 * Working-tree status (untracked included). `--untracked-files=all` lists
-* the CONTENTS of new directories as individual entries (`?? newdir/a.ts`
-* rather than a collapsed `?? newdir/`), so every row in the source-control
-* panel is a real file whose diff tab can load. With `=normal`, git folds a
-* new folder into one trailing-slash entry that has no diff output and
-* cannot be read as a file.
+* the contents of new directories as individual entries, while preserving
+* repository discovery and explicit repository selection for workspace roots.
 */
-async function status(cwd) {
-	if (!await isGitRepo(cwd)) return {
+async function status(cwd, selected) {
+	const repositories = await repoRoots(cwd);
+	if (repositories.length === 0) return {
 		isRepo: false,
-		entries: []
+		entries: [],
+		repositories: []
 	};
-	const [branch, raw] = await Promise.all([currentBranch(cwd).catch(() => "HEAD"), runGit(cwd, [
+	const root = await repoRoot(cwd, selected);
+	const [branch, raw] = await Promise.all([currentBranch(root).catch(() => "HEAD"), runGit(root, [
 		"status",
 		"--porcelain=v1",
 		"-z",
 		"--untracked-files=all"
 	])]);
+	const parsed = parsePorcelainZ(raw);
+	const truncated = parsed.length > GIT_STATUS_LIMIT;
 	return {
 		isRepo: true,
 		branch,
-		entries: parsePorcelainZ(raw)
+		entries: truncated ? parsed.slice(0, GIT_STATUS_LIMIT) : parsed,
+		truncated,
+		root,
+		repositories
 	};
 }
+/** Platform-aware identity used only for comparing absolute checkout roots. */
+function pathIdentity(path) {
+	const absolute = resolve(path).replace(/[\\/]+$/, "");
+	return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+/** Raw usable checkout records, shared by inventory and target validation.
+* Prunable records point at missing paths and are deliberately excluded from
+* both the selector and the command-target allowlist. */
+async function listedWorktrees(cwd) {
+	return parseWorktreeList(await runGit(cwd, [
+		"worktree",
+		"list",
+		"--porcelain",
+		"-z"
+	])).filter((entry) => !entry.prunable);
+}
+/** All linked checkouts of the repository containing `cwd`, enriched with a
+* live change count. The current checkout is first so a single-worktree repo
+* preserves the old UI ordering. */
+async function worktrees(cwd) {
+	if (!await isGitRepo(cwd)) return [];
+	const currentRoot = await repoRoot(cwd);
+	const listed = await listedWorktrees(cwd);
+	return (await Promise.all(listed.map(async (entry) => ({
+		path: entry.path,
+		branch: entry.branch,
+		current: pathIdentity(entry.path) === pathIdentity(currentRoot),
+		changes: await status(entry.path).then((result) => result.entries.length, () => 0)
+	})))).sort((left, right) => Number(right.current) - Number(left.current));
+}
+/** Resolve an optional client-selected linked checkout. A caller may never use
+* this seam to point Git operations at an unrelated repository: the target
+* must occur in the authoritative session repository's worktree list. */
+async function resolveWorktree(cwd, requested) {
+	if (requested === void 0 || requested === "") return cwd;
+	const identity = pathIdentity(requested);
+	const match = (await listedWorktrees(cwd)).find((entry) => pathIdentity(entry.path) === identity);
+	if (match === void 0) throw new GitCommandError(`unknown linked worktree: ${requested}`, "git-worktree", "worktree list");
+	return match.path;
+}
 /** Diff text of the worktree (unstaged) or the index (staged). */
-async function diff(cwd, path, staged) {
+async function diff(cwd, path, staged, selected) {
+	const root = await repoRoot(cwd, selected);
 	const args = [
 		"diff",
 		"--no-ext-diff",
@@ -912,35 +1172,36 @@ async function diff(cwd, path, staged) {
 	];
 	if (staged) args.push("--cached");
 	if (path !== void 0) args.push("--", path);
-	return runGit(cwd, args);
+	return runGit(root, args);
 }
 /** Stage paths (all when path is undefined). */
-async function stage(cwd, path) {
-	await runGit(cwd, [
+async function stage(cwd, path, selected) {
+	await runGit(await repoRoot(cwd, selected), [
 		"add",
 		"-A",
 		...path !== void 0 ? ["--", path] : []
 	]);
 }
 /** Unstage paths (all when path is undefined). */
-async function unstage(cwd, path) {
-	await runGit(cwd, [
+async function unstage(cwd, path, selected) {
+	await runGit(await repoRoot(cwd, selected), [
 		"reset",
 		"-q",
 		...path !== void 0 ? ["--", path] : []
 	]);
 }
 /** Commit the staged changes with a message (global identity untouched). */
-async function commit(cwd, message) {
-	await runGit(cwd, [
+async function commit(cwd, message, selected) {
+	await runGit(await repoRoot(cwd, selected), [
 		"commit",
 		"-m",
 		message
 	]);
 }
 /** Branch names (current first). */
-async function branches(cwd) {
-	const [current, raw] = await Promise.all([currentBranch(cwd).catch(() => "HEAD"), runGit(cwd, [
+async function branches(cwd, selected) {
+	const root = await repoRoot(cwd, selected);
+	const [current, raw] = await Promise.all([currentBranch(root).catch(() => "HEAD"), runGit(root, [
 		"for-each-ref",
 		"--format=%(refname:short)",
 		"refs/heads"
@@ -952,12 +1213,12 @@ async function branches(cwd) {
 	};
 }
 /** Switch to an existing branch. */
-async function checkout(cwd, branch) {
-	await runGit(cwd, ["checkout", branch]);
+async function checkout(cwd, branch, selected) {
+	await runGit(await repoRoot(cwd, selected), ["checkout", branch]);
 }
 /** Recent commit history (newest first), lazily pageable via skip/count. */
-async function log(cwd, count = 30, skip = 0) {
-	return parseLogLines(await runGit(cwd, [
+async function log(cwd, count = 30, skip = 0, selected) {
+	return parseLogLines(await runGit(await repoRoot(cwd, selected), [
 		"log",
 		"-n",
 		String(count),
@@ -971,9 +1232,9 @@ async function log(cwd, count = 30, skip = 0) {
 * Content of a file at a revision (`git show <rev>:<path>`), or null when the
 * revision has no such path (a new/untracked file has no HEAD side).
 */
-async function show(cwd, rev, path) {
+async function show(cwd, rev, path, selected) {
 	try {
-		return await runGit(cwd, ["show", `${rev}:${path}`]);
+		return await runGit(await repoRoot(cwd, selected), ["show", `${rev}:${path}`]);
 	} catch {
 		return null;
 	}
@@ -981,8 +1242,8 @@ async function show(cwd, rev, path) {
 /** Full patch text of one commit (`git show` with the commit header suppressed).
 *  Merge commits show their diff against the first parent (`-m --first-parent`
 *  is a no-op for regular commits), so a history click always has content. */
-async function commitDiff(cwd, hash) {
-	return runGit(cwd, [
+async function commitDiff(cwd, hash, selected) {
+	return runGit(await repoRoot(cwd, selected), [
 		"show",
 		"--no-ext-diff",
 		"--no-color",
@@ -993,24 +1254,24 @@ async function commitDiff(cwd, hash) {
 	]);
 }
 /** Discard the worktree changes of one path (`git checkout -- <path>`; the index is untouched). */
-async function discard(cwd, path) {
-	await runGit(cwd, [
+async function discard(cwd, path, selected) {
+	await runGit(await repoRoot(cwd, selected), [
 		"checkout",
 		"--",
 		path
 	]);
 }
 /** Revert one commit onto the current branch with an auto-generated message. */
-async function revert(cwd, hash) {
-	await runGit(cwd, [
+async function revert(cwd, hash, selected) {
+	await runGit(await repoRoot(cwd, selected), [
 		"revert",
 		"--no-edit",
 		hash
 	]);
 }
 /** Cherry-pick one commit onto the current branch. */
-async function cherryPick(cwd, hash) {
-	await runGit(cwd, ["cherry-pick", hash]);
+async function cherryPick(cwd, hash, selected) {
+	await runGit(await repoRoot(cwd, selected), ["cherry-pick", hash]);
 }
 //#endregion
 //#region src/pty-deps.ts
@@ -1874,20 +2135,20 @@ function boundBytes(text, maxBytes) {
 	};
 }
 /** Pure text projection helper (the canonical value is already structured). */
-function textRender(fn) {
+function textRender$1(fn) {
 	return (_args, value) => [{
 		type: "text",
 		text: fn(value)
 	}];
 }
 /** Extract the calling agent or throw the canonical "no agent" error. */
-function requireAgent(agent) {
+function requireAgent$1(agent) {
 	if (agent === void 0) throw new Error("sidebar terminal tools require an initiating agent");
 	return agent;
 }
 /** Resolve the calling agent's session id (the registry scope + ownership key). */
-function sessionIdOf(exec) {
-	return requireAgent(exec.agent).session.id;
+function sessionIdOf$1(exec) {
+	return requireAgent$1(exec.agent).session.id;
 }
 /**
 * Register the eight terminal tools against the host tool registry. The
@@ -1899,7 +2160,10 @@ function sessionIdOf(exec) {
 * session's terminals.
 * @param ctx - host plugin context (carries the tools service).
 * @param registry - the agent-owned terminal registry.
-* @param resolveCwd - live cwd resolver for one session id.
+* @param resolveCwd - async cwd resolver for one session id. Resolves through
+*  the session header, the client-supplied cwd, and the persistence index
+*  before falling back to the host process cwd (production always provides
+*  persistence, so the fallback is reached only in tests / stripped-down hosts).
 * @returns a disposer that unregisters all eight tools (the caller gates
 * registration on the side-card setting and calls this to turn them off).
 */
@@ -1940,18 +2204,17 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 					}
 				}
 			},
-			render: textRender((v) => `Opened terminal "${v.title}" (uuid: ${v.uuid}). The sidebar tab appears automatically; use terminal_read to see output and terminal_send (with submit=true) to run more commands.`)
+			render: textRender$1((v) => `Opened terminal "${v.title}" (uuid: ${v.uuid}). The sidebar tab appears automatically; use terminal_read to see output and terminal_send (with submit=true) to run more commands.`)
 		},
-		execute: (args, exec) => {
+		execute: async (args, exec) => {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
-			const cwd = resolveCwd(sessionId);
+			const sessionId = sessionIdOf$1(exec);
+			const cwd = await resolveCwd(sessionId);
 			const { shell, shellArgs } = readShellOverrides();
-			const uuid = registry.create(sessionId, args.title, args.command, cwd, 80, 24, shell, shellArgs);
-			return Promise.resolve({
-				uuid,
+			return {
+				uuid: registry.create(sessionId, args.title, args.command, cwd, 80, 24, shell, shellArgs),
 				title: args.title
-			});
+			};
 		}
 	}));
 	register(defineTool({
@@ -2002,7 +2265,7 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 			}
 		},
 		execute: (_args, exec) => {
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			return Promise.resolve(registry.list(sessionId));
 		}
 	}));
@@ -2041,11 +2304,11 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 					}
 				}
 			},
-			render: textRender((v) => `Sent ${v.bytes} byte(s) to terminal ${v.uuid}.`)
+			render: textRender$1((v) => `Sent ${v.bytes} byte(s) to terminal ${v.uuid}.`)
 		},
 		execute: (args, exec) => {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			registry.assertOwned(args.uuid, sessionId);
 			const payload = args.submit === true ? `${args.text}\r` : args.text;
 			registry.send(args.uuid, payload);
@@ -2115,7 +2378,7 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 		},
 		execute: (args, exec) => {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			registry.assertOwned(args.uuid, sessionId);
 			const result = registry.read(args.uuid, args.offset, args.count);
 			const bounded = boundBytes(result.text, READ_BYTE_LIMIT);
@@ -2247,7 +2510,7 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 		},
 		async execute(args, exec) {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			registry.assertOwned(args.uuid, sessionId);
 			const timeoutMs = args.timeout_ms ?? 1e4;
 			return await registry.waitFor(args.uuid, args.needle, timeoutMs, exec.signal);
@@ -2292,11 +2555,11 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 					}
 				}
 			},
-			render: textRender((v) => `Resized terminal ${v.uuid} to ${v.cols}×${v.rows}.`)
+			render: textRender$1((v) => `Resized terminal ${v.uuid} to ${v.cols}×${v.rows}.`)
 		},
 		execute: (args, exec) => {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			registry.assertOwned(args.uuid, sessionId);
 			const dims = registry.resize(args.uuid, args.cols, args.rows);
 			return Promise.resolve({
@@ -2336,11 +2599,11 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 					}
 				}
 			},
-			render: textRender((v) => `Sent ${v.signal} to terminal ${v.uuid}.`)
+			render: textRender$1((v) => `Sent ${v.signal} to terminal ${v.uuid}.`)
 		},
 		execute: (args, exec) => {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			registry.assertOwned(args.uuid, sessionId);
 			registry.signal(args.uuid, args.signal);
 			return Promise.resolve({
@@ -2373,11 +2636,11 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 					}
 				}
 			},
-			render: textRender((v) => v.closed ? `Closed terminal ${v.uuid}.` : `Terminal ${v.uuid} was already closed.`)
+			render: textRender$1((v) => v.closed ? `Closed terminal ${v.uuid}.` : `Terminal ${v.uuid} was already closed.`)
 		},
 		execute: (args, exec) => {
 			exec.signal.throwIfAborted();
-			const sessionId = sessionIdOf(exec);
+			const sessionId = sessionIdOf$1(exec);
 			registry.assertOwned(args.uuid, sessionId);
 			const closed = registry.close(args.uuid);
 			return Promise.resolve({
@@ -2389,6 +2652,242 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 	return () => {
 		for (const dispose of disposers) dispose();
 	};
+}
+//#endregion
+//#region src/agent-opens.ts
+/**
+* The model-facing `sidebar_open` tool and its delivery registry.
+*
+* One tool lets the model actively open a local file, a local folder (as a
+* tree rooted there), or an HTTP(S) page in the CALLING session's sidebar.
+* Mirroring the agent-terminal tools, the tool binds to the calling agent's
+* session through `exec.agent.session.id` — the model never passes a
+* sessionId, and opens for non-active sessions are queued until that
+* session's sidebar view is next connected.
+*
+* Delivery is a host→browser push over the dedicated `/sidebar/ws/agent-opens`
+* endpoint (the same pattern as `/sidebar/ws/agent-terminals`): the registry
+* keeps a per-session queue; a push is consumed on send (`delivered: true`
+* means a sidebar view was attached at call time), otherwise the request
+* stays queued and is replayed when a view for that session attaches.
+*
+* Conventions (per plugin-development-guide.md §3):
+*   C1 — parameters schema-validated before `execute` runs.
+*   C4 — `execute` returns one canonical JSON value; `render` is a separate
+*        pure text projection.
+*   C6 — `exec.signal.throwIfAborted()` before any fs work.
+*   C10 — no UI/transport vocabulary in the canonical value.
+*/
+/**
+* Per-session queue of open requests plus the connected sidebar views.
+*
+* Lifecycle: `enqueue` adds a request and — when at least one view for the
+* session is attached — pushes it immediately and removes it from the queue
+* (consume-on-send: a reconnect must never replay an open the client already
+* applied, and the browser tab type has no per-URL dedupe, so replaying
+* would mint duplicate tabs). With no attached view the request stays queued
+* and `attach` replays it on connect. `drainAll` drops every queued request
+* (the feature was turned off); `dispose` also drops every subscriber.
+*/
+var AgentOpenRegistry = class {
+	pending = /* @__PURE__ */ new Map();
+	subscribers = /* @__PURE__ */ new Map();
+	/** Queue one open and deliver it immediately when a view is attached.
+	* @returns the request id and whether a connected view received it now. */
+	enqueue(sessionId, kind, target, title) {
+		const request = {
+			id: randomUUID(),
+			sessionId,
+			kind,
+			target,
+			title
+		};
+		const list = this.pending.get(sessionId) ?? [];
+		list.push(request);
+		this.pending.set(sessionId, list);
+		const views = this.subscribers.get(sessionId);
+		if (views !== void 0 && views.size > 0) {
+			for (const send of views) send(request);
+			this.pending.delete(sessionId);
+			return {
+				id: request.id,
+				delivered: true
+			};
+		}
+		return {
+			id: request.id,
+			delivered: false
+		};
+	}
+	/** Attach one sidebar view (replays queued requests; consume-on-send).
+	* @returns the disposer detaching the view. */
+	attach(sessionId, send) {
+		let views = this.subscribers.get(sessionId);
+		if (views === void 0) {
+			views = /* @__PURE__ */ new Set();
+			this.subscribers.set(sessionId, views);
+		}
+		views.add(send);
+		const queued = this.pending.get(sessionId) ?? [];
+		if (queued.length > 0) {
+			for (const request of queued) send(request);
+			this.pending.delete(sessionId);
+		}
+		return () => {
+			const current = this.subscribers.get(sessionId);
+			current?.delete(send);
+			if (current !== void 0 && current.size === 0) this.subscribers.delete(sessionId);
+		};
+	}
+	/** Drop every queued request (the feature was turned off mid-session). */
+	drainAll() {
+		this.pending.clear();
+	}
+	/** Drop the queue and every subscriber (plugin teardown). */
+	dispose() {
+		this.pending.clear();
+		this.subscribers.clear();
+	}
+};
+/** Extract the calling agent or throw the canonical "no agent" error. */
+function requireAgent(agent) {
+	if (agent === void 0) throw new Error("sidebar_open requires an initiating agent");
+	return agent;
+}
+/** Resolve the calling agent's session id (the queue scope + ownership key). */
+function sessionIdOf(exec) {
+	return requireAgent(exec.agent).session.id;
+}
+/** Pure text projection helper (the canonical value is already structured). */
+function textRender(fn) {
+	return (_args, value) => [{
+		type: "text",
+		text: fn(value)
+	}];
+}
+/** Classify a raw target: http(s) URL or a local path (stat-driven). */
+async function classifyTarget(raw, cwd) {
+	if (/^https?:\/\//i.test(raw)) {
+		let parsed;
+		try {
+			parsed = new URL(raw);
+		} catch {
+			throw new Error(`"${raw}" is not a valid URL`);
+		}
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("sidebar_open only accepts http:// and https:// URLs");
+		return {
+			kind: "url",
+			target: raw,
+			title: parsed.hostname !== "" ? parsed.hostname : raw
+		};
+	}
+	if (!isWindowsDrivePrefix(raw) && /^[a-z][a-z0-9+.-]*:/i.test(raw)) throw new Error("sidebar_open only accepts http:// and https:// URLs; use a local path for files");
+	const target = resolve(isAbsolute(raw) ? raw : join(cwd, raw));
+	let info;
+	try {
+		info = await stat(target);
+	} catch (error) {
+		const code = error.code;
+		if (code === "ENOENT") throw new Error(`"${raw}" does not exist (resolved to "${target}")`);
+		if (code === "EACCES" || code === "EPERM") throw new Error(`"${target}" is not readable`);
+		throw new Error(`cannot open "${target}": ${error instanceof Error ? error.message : String(error)}`);
+	}
+	const title = basenameOf(target);
+	return {
+		kind: info.isDirectory() ? "folder" : "file",
+		target,
+		title: title === "" ? raw : title
+	};
+}
+/** The last path segment (mirror of the client's FileTree baseName). */
+function basenameOf(path) {
+	const trimmed = path.replace(/[\\/]+$/, "");
+	const at = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+	return at === -1 ? trimmed : trimmed.slice(at + 1);
+}
+/** Whether a raw target starts with a Windows drive prefix (`C:\` / `C:/`). */
+function isWindowsDrivePrefix(raw) {
+	return /^[a-zA-Z]:[\\/]/.test(raw);
+}
+/**
+* Register the `sidebar_open` tool against the host tool registry. The tool
+* is gated by the side-card setting `agentOpenTools` (the caller registers
+* and unregisters it); `readPrefs` supplies the live prefs so a disabled
+* target tab type (editor/browser) is reported to the model instead of
+* silently no-oping on the client. `resolveCwd` threads the calling
+* session's live cwd so relative paths resolve the same way the sidebar's
+* own routes do.
+* @param ctx - host plugin context (carries the tools service).
+* @param registry - the open-request registry (per-session queue + views).
+* @param resolveCwd - async cwd resolver for one session id. Resolves through
+*  the session header, the client-supplied cwd, and the persistence index
+*  before falling back to the host process cwd (production always provides
+*  persistence, so the fallback is reached only in tests / stripped-down hosts).
+* @param readPrefs - live resolved side card prefs (for tab enable gates).
+* @returns a disposer that unregisters the tool.
+*/
+function registerOpenTool(ctx, registry, resolveCwd, readPrefs) {
+	return ctx.tools.register(defineTool({
+		name: "sidebar_open",
+		description: "Open a local file, a local folder, or an HTTP(S) page in the sidebar of the calling conversation. A file opens in the sidebar editor (per-path dedupe: an already-open file is focused); a folder opens a file window whose tree is rooted at that folder; a URL opens in the sidebar browser (sandboxed iframe). The panel auto-expands for content opens and the tab title defaults to the file/folder name or the URL hostname. The path may be absolute or relative to the session working directory. The open lands in the CALLING session's sidebar: while that session's sidebar view is not connected (e.g. the session is not the active one), the open is queued and delivered when the session sidebar is next shown — the result reports `delivered` so you know whether it is visible right now. The side card setting \"model opens files/folders/pages in the sidebar\" must be on, and the target tab type must be enabled in that session's settings.",
+		parameters: {
+			target: {
+				type: "string",
+				required: true,
+				description: "Absolute or session-cwd-relative local path, or an http:// / https:// URL."
+			},
+			title: {
+				type: "string",
+				description: "Optional tab title (defaults to the file/folder name or the URL hostname)."
+			}
+		},
+		output: {
+			schema: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					kind: {
+						type: "string",
+						required: true,
+						description: "What was opened: file | folder | url."
+					},
+					target: {
+						type: "string",
+						required: true,
+						description: "The absolute path or URL the open was requested for."
+					},
+					title: {
+						type: "string",
+						required: true,
+						description: "The tab title used (provided title, basename, or hostname)."
+					},
+					delivered: {
+						type: "boolean",
+						required: true,
+						description: "Whether the open was pushed to a connected sidebar at call time (false = queued until the session sidebar is next shown)."
+					}
+				}
+			},
+			render: textRender((v) => v.delivered ? `Opened ${v.kind} "${v.title}" (${v.target}) in the sidebar.` : `Requested opening ${v.kind} "${v.title}" (${v.target}) in the sidebar — the session sidebar is not connected yet, so the open is queued and will appear when it is next shown.`)
+		},
+		execute: async (args, exec) => {
+			exec.signal.throwIfAborted();
+			const sessionId = sessionIdOf(exec);
+			const cwd = await resolveCwd(sessionId);
+			const { kind, target, title: defaultTitle } = await classifyTarget(args.target, cwd);
+			const prefs = readPrefs();
+			const tab = kind === "url" ? "browser" : "editor";
+			if (prefs.tabsEnabled[tab] === false) throw new Error(`the built-in ${tab} tab is disabled in the side card settings; ask the user to enable it (or disable this tool)`);
+			const title = args.title !== void 0 && args.title.trim() !== "" ? args.title : defaultTitle;
+			const { delivered } = registry.enqueue(sessionId, kind, target, title);
+			return {
+				kind,
+				target,
+				title,
+				delivered
+			};
+		}
+	}));
 }
 //#endregion
 //#region src/jobs-routes.ts
@@ -3232,12 +3731,17 @@ function mediaTypeForPath(path) {
 * header wins; while the session is still hydrating from persistence (the
 * web client attaches the current conversation a moment after page load, so
 * the very first sidebar requests can arrive detached) the caller's own
-* list-summary cwd is used; the process cwd is the last resort (blank
-* sessions have no cwd anywhere yet). Never throws for a missing cwd, so
-* explorer/git/terminal work from first paint instead of surfacing
-* "session ... has no working directory".
+* list-summary cwd is used; the session-persistence index is queried as a
+* last resort for cold (not-yet-attached) sessions so a detached first
+* request still resolves the correct project instead of the host process
+* cwd (which on Windows is the DSH source root after `dsh.cmd`'s `pushd`,
+* causing every user-project path to be misclassified as "outside
+* workspace"). The host process cwd is the FINAL fallback for deployments
+* without persistence (tests / stripped-down hosts); production always
+* provides persistence, so the bug-fix path (header → client → persistence)
+* always resolves the real session cwd before reaching it.
 */
-function sessionCwdOf(ctx, sessionId, clientCwd) {
+async function sessionCwdOf(ctx, sessionId, clientCwd) {
 	const headerCwd = ctx.sessions.get(sessionId)?.header.cwd;
 	if (headerCwd !== void 0 && headerCwd !== "") return headerCwd;
 	if (clientCwd !== void 0 && clientCwd !== "") try {
@@ -3245,7 +3749,21 @@ function sessionCwdOf(ctx, sessionId, clientCwd) {
 	} catch {
 		throw new SidebarError("bad-request", `invalid working directory "${clientCwd}"`);
 	}
+	const persistence = ctx.get("sessionPersistence");
+	if (persistence !== void 0) {
+		const metaCwd = (await persistence.inspect(sessionId)).meta.cwd;
+		if (metaCwd !== void 0 && metaCwd !== "") try {
+			return requireAbsolute(metaCwd);
+		} catch {
+			throw new SidebarError("bad-request", `invalid working directory "${metaCwd}"`);
+		}
+	}
 	return process.cwd();
+}
+/** Optional repository selected by the Git panel when cwd is a container. */
+function selectedRepoOf(payload) {
+	if (payload.repoRoot === void 0) return void 0;
+	return requireAbsolute(requireString(payload, "repoRoot"));
 }
 /**
 * Resolve a path that a git command reported — `git status`/`git diff`
@@ -3254,9 +3772,11 @@ function sessionCwdOf(ctx, sessionId, clientCwd) {
 * paths pass through; relative ones join the repo root (falling back to the
 * cwd when the root cannot be resolved, e.g. a bare directory).
 */
-async function resolveGitPath(cwd, raw) {
+async function resolveGitPath(cwd, raw, selected) {
 	if (isAbsolute(raw)) return requireAbsolute(raw);
-	const root = await repoRoot(cwd).catch(() => cwd);
+	const sessionPath = requireAbsolute(join(cwd, raw));
+	if (await stat(sessionPath).then(() => true).catch(() => false)) return sessionPath;
+	const root = await repoRoot(cwd, selected).catch(() => cwd);
 	return requireAbsolute(join(root, raw));
 }
 /** How many leading bytes a binary read returns for client-side detect sniffing. */
@@ -3310,20 +3830,48 @@ function shellOverridesOf(getSettings) {
 		shellArgs: args === "" ? void 0 : args.split(/\s+/).filter(Boolean)
 	};
 }
+/**
+* Parse the browser tab's `browserAllowedLoopback` allowlist into a matcher
+* over host:port (same contract as the client-side helper in
+* src/client/browser.ts — kept in sync). Bare hosts (`localhost`,
+* `127.0.0.1`) match every port; `host:port` entries match exactly.
+*/
+function parseLoopbackAllowlist(allowlist) {
+	const entries = allowlist.split(",").map((entry) => entry.trim().toLowerCase()).filter((entry) => entry !== "");
+	const exact = new Set(entries);
+	const hosts = /* @__PURE__ */ new Set();
+	for (const entry of entries) if (!entry.includes(":")) hosts.add(entry.replace(/^\[|\]$/g, ""));
+	return (host, port) => {
+		const key = `${host}:${port}`;
+		if (exact.has(key) || exact.has(host)) return true;
+		return port !== "" && hosts.has(host);
+	};
+}
 function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, getSettings) {
-	const cwdOf = (payload) => {
+	const cwdOf = async (payload) => {
 		const sessionId = requireString(payload, "sessionId");
 		const record = payload;
 		return {
 			sessionId,
-			cwd: sessionCwdOf(ctx, sessionId, typeof record?.cwd === "string" && record.cwd !== "" ? record.cwd : void 0)
+			cwd: await sessionCwdOf(ctx, sessionId, typeof record?.cwd === "string" && record.cwd !== "" ? record.cwd : void 0)
+		};
+	};
+	/** Resolve the optional Git-panel checkout selector against the authoritative
+	* session repository. Unlike `cwd`, `worktree` is never trusted directly. */
+	const gitCwdOf = async (payload) => {
+		const base = await cwdOf(payload);
+		const record = payload;
+		const requested = typeof record?.worktree === "string" && record.worktree !== "" ? record.worktree : void 0;
+		return {
+			sessionId: base.sessionId,
+			cwd: await resolveWorktree(base.cwd, requested)
 		};
 	};
 	const jobsApi = buildJobsApi(ctx, resolved.readLimit);
 	const subagentLiveApi = buildSubagentLiveApi(ctx);
 	return {
-		"session.cwd": (payload) => {
-			const { sessionId, cwd } = cwdOf(payload);
+		"session.cwd": async (payload) => {
+			const { sessionId, cwd } = await cwdOf(payload);
 			return {
 				sessionId,
 				cwd,
@@ -3332,16 +3880,17 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 			};
 		},
 		"fs.tree": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			return listDirectory(payload.path === void 0 ? cwd : requireAbsolute(requireString(payload, "path")), resolved.listLimit);
+			const { cwd } = await cwdOf(payload);
+			return listDirectory(payload.path === void 0 ? cwd : await ensureWorkspacePath(cwd, requireString(payload, "path")), resolved.listLimit);
 		},
 		"fs.search": async (payload) => {
-			const { cwd } = cwdOf(payload);
+			const { cwd } = await cwdOf(payload);
 			return searchFiles(cwd, requireString(payload, "query"));
 		},
 		"fs.read": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			const { content, truncated, binary, size, head } = await readText(await resolveGitPath(cwd, requireString(payload, "path")), resolved.readLimit);
+			const { cwd } = await cwdOf(payload);
+			const selected = selectedRepoOf(payload);
+			const { content, truncated, binary, size, head } = await readText(await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, "path"), selected)), resolved.readLimit);
 			if (binary) return {
 				kind: "binary",
 				size,
@@ -3355,8 +3904,8 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 			};
 		},
 		"fs.write": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			const path = requireAbsolute(requireString(payload, "path"));
+			const { cwd } = await cwdOf(payload);
+			const path = await ensureWorkspaceWritePath(cwd, requireString(payload, "path"));
 			const content = requireString(payload, "content");
 			const tmp = `${path}.dsh-sidebar-tmp-${process.pid}`;
 			try {
@@ -3369,67 +3918,75 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 			}
 			return { ok: true };
 		},
+		"git.worktrees": async (payload) => {
+			const { cwd } = await gitCwdOf(payload);
+			const selected = selectedRepoOf(payload);
+			return worktrees(selected !== void 0 ? await repoRoot(cwd, selected).catch(() => cwd) : cwd);
+		},
 		"git.status": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			return status(cwd);
+			const { cwd } = await gitCwdOf(payload);
+			return status(cwd, selectedRepoOf(payload));
 		},
 		"git.diff": async (payload) => {
-			const { cwd } = cwdOf(payload);
+			const { cwd } = await gitCwdOf(payload);
 			const record = payload;
-			return { diff: await diff(cwd, record.path === void 0 ? void 0 : await resolveGitPath(cwd, requireString(payload, "path")), record.staged === true) };
+			const repoRoot = selectedRepoOf(payload);
+			return { diff: await diff(cwd, record.path === void 0 ? void 0 : await resolveGitPath(cwd, requireString(payload, "path"), repoRoot), record.staged === true, repoRoot) };
 		},
 		"git.stage": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await stage(cwd, payload.path === void 0 ? void 0 : requireString(payload, "path"));
+			const { cwd } = await gitCwdOf(payload);
+			await stage(cwd, payload.path === void 0 ? void 0 : requireString(payload, "path"), selectedRepoOf(payload));
 			return { ok: true };
 		},
 		"git.unstage": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await unstage(cwd, payload.path === void 0 ? void 0 : requireString(payload, "path"));
+			const { cwd } = await gitCwdOf(payload);
+			await unstage(cwd, payload.path === void 0 ? void 0 : requireString(payload, "path"), selectedRepoOf(payload));
 			return { ok: true };
 		},
 		"git.commit": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await commit(cwd, requireString(payload, "message"));
+			const { cwd } = await gitCwdOf(payload);
+			await commit(cwd, requireString(payload, "message"), selectedRepoOf(payload));
 			return { ok: true };
 		},
 		"git.branch": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			return branches(cwd);
+			const { cwd } = await gitCwdOf(payload);
+			return branches(cwd, selectedRepoOf(payload));
 		},
 		"git.checkout": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await checkout(cwd, requireString(payload, "branch"));
+			const { cwd } = await gitCwdOf(payload);
+			await checkout(cwd, requireString(payload, "branch"), selectedRepoOf(payload));
 			return { ok: true };
 		},
 		"git.log": async (payload) => {
-			const { cwd } = cwdOf(payload);
+			const { cwd } = await gitCwdOf(payload);
 			const record = payload;
-			return log(cwd, typeof record.count === "number" && Number.isInteger(record.count) && record.count > 0 ? record.count : void 0, typeof record.skip === "number" && Number.isInteger(record.skip) && record.skip >= 0 ? record.skip : void 0);
+			return log(cwd, typeof record.count === "number" && Number.isInteger(record.count) && record.count > 0 ? record.count : void 0, typeof record.skip === "number" && Number.isInteger(record.skip) && record.skip >= 0 ? record.skip : void 0, selectedRepoOf(payload));
 		},
 		"git.commit-diff": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			return { diff: await commitDiff(cwd, requireString(payload, "hash")) };
+			const { cwd } = await gitCwdOf(payload);
+			return { diff: await commitDiff(cwd, requireString(payload, "hash"), selectedRepoOf(payload)) };
 		},
 		"git.discard": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await discard(cwd, await resolveGitPath(cwd, requireString(payload, "path")));
+			const { cwd } = await gitCwdOf(payload);
+			const repoRoot = selectedRepoOf(payload);
+			await discard(cwd, await resolveGitPath(cwd, requireString(payload, "path"), repoRoot), repoRoot);
 			return { ok: true };
 		},
 		"git.revert": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await revert(cwd, requireString(payload, "hash"));
+			const { cwd } = await gitCwdOf(payload);
+			await revert(cwd, requireString(payload, "hash"), selectedRepoOf(payload));
 			return { ok: true };
 		},
 		"git.cherry-pick": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			await cherryPick(cwd, requireString(payload, "hash"));
+			const { cwd } = await gitCwdOf(payload);
+			await cherryPick(cwd, requireString(payload, "hash"), selectedRepoOf(payload));
 			return { ok: true };
 		},
 		"git.show": async (payload) => {
-			const { cwd } = cwdOf(payload);
-			const path = await resolveGitPath(cwd, requireString(payload, "path"));
-			return { content: await show(cwd, requireString(payload, "rev"), path) };
+			const { cwd } = await gitCwdOf(payload);
+			const repoRoot = selectedRepoOf(payload);
+			const path = await resolveGitPath(cwd, requireString(payload, "path"), repoRoot);
+			return { content: await show(cwd, requireString(payload, "rev"), path, repoRoot) };
 		},
 		"pty.close": (payload) => {
 			const sessionId = requireString(payload, "sessionId");
@@ -3484,7 +4041,11 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 				throw new SidebarError("bad-request", "invalid url", 400);
 			}
 			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new SidebarError("bad-request", "only http/https urls can be probed", 400);
-			if (isLoopbackHostname(parsed.hostname)) throw new SidebarError("bad-request", "local addresses are not probed", 400);
+			if (isLoopbackHostname(parsed.hostname)) {
+				const prefs = getSettings()?.get()?.value;
+				const allowlist = typeof prefs?.browserAllowedLoopback === "string" ? prefs.browserAllowedLoopback : "";
+				if (!(allowlist.trim() !== "" && parseLoopbackAllowlist(allowlist)(parsed.hostname, parsed.port))) throw new SidebarError("bad-request", "local addresses are not probed", 400);
+			}
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), 8e3);
 			try {
@@ -3493,13 +4054,23 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 					redirect: "follow",
 					signal: controller.signal
 				});
-				if (response.status === 405 || response.status === 501) response = await fetch(parsed, {
+				let retriedFromHeadRejection = false;
+				if (response.status === 405 || response.status === 501) {
+					response = await fetch(parsed, {
+						method: "GET",
+						redirect: "follow",
+						signal: controller.signal
+					});
+					retriedFromHeadRejection = true;
+				}
+				if (!(response.headers.get("content-security-policy") !== null || response.headers.get("x-frame-options") !== null) && !retriedFromHeadRejection && response.status !== 405 && response.status !== 501) response = await fetch(parsed, {
 					method: "GET",
 					redirect: "follow",
 					signal: controller.signal
 				});
 				const frameAncestors = extractFrameAncestors(response.headers.get("content-security-policy"));
 				const xFrameOptions = response.headers.get("x-frame-options");
+				response.body?.cancel();
 				return {
 					reachable: true,
 					url: response.url,
@@ -3542,8 +4113,10 @@ function apply(ctx, config) {
 	}
 	const ptyManager = nodePty !== null ? new PtyManager(terminalShell, resolved.terminalsPerSession, resolved.shellArgs, nodePty) : null;
 	const agentPtyRegistry = nodePty !== null ? new AgentPtyRegistry(terminalShell, resolved.shellArgs, nodePty) : null;
+	const agentOpenRegistry = new AgentOpenRegistry();
 	let settingsFace;
 	let toolsDisposers = null;
+	let openToolsDisposers = null;
 	const syncToolsGate = (scope) => {
 		if (scope.get().agentTerminalTools) {
 			if (toolsDisposers === null) {
@@ -3581,8 +4154,22 @@ function apply(ctx, config) {
 			}
 		};
 		syncToolsGate(scope);
+		const syncOpenToolsGate = () => {
+			if (scope.get().agentOpenTools) {
+				if (openToolsDisposers === null) openToolsDisposers = registerOpenTool(ctx, agentOpenRegistry, (sessionId) => sessionCwdOf(ctx, sessionId), () => {
+					const value = (settingsFace?.get())?.value;
+					return value !== null && typeof value === "object" ? value : SIDEBAR_PREFS_DEFAULTS;
+				});
+			} else if (openToolsDisposers !== null) {
+				openToolsDisposers();
+				openToolsDisposers = null;
+				agentOpenRegistry.drainAll();
+			}
+		};
+		syncOpenToolsGate();
 		scope.watch(() => {
 			syncToolsGate(scope);
+			syncOpenToolsGate();
 		});
 	});
 	const api = buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, () => settingsFace);
@@ -3657,7 +4244,7 @@ function apply(ctx, config) {
 				const relativePath = url.searchParams.get("relativePath");
 				if (sessionId === null || dir === null || relativePath === null || relativePath.trim() === "") throw new SidebarError("bad-request", "sessionId, dir, and relativePath are required");
 				const { path, size } = await writeWorkspaceUpload({
-					cwd: sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0),
+					cwd: await sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0),
 					dir,
 					relativePath,
 					chunks: req,
@@ -3692,9 +4279,7 @@ function apply(ctx, config) {
 				const sessionId = url.searchParams.get("sessionId");
 				const raw = url.searchParams.get("path");
 				if (sessionId === null || raw === null) throw new SidebarError("bad-request", "sessionId and path are required");
-				const cwd = sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0);
-				const path = requireAbsolute(raw);
-				if (!isWithin(cwd, path)) throw new SidebarError("fs-error", "media path outside the session working directory", 403);
+				const path = await ensureWorkspacePath(await sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0), raw);
 				const info = await stat(path);
 				if (!info.isFile() || info.size > resolved.mediaLimit) throw new SidebarError("fs-error", "not a file or too large", 400);
 				const type = mediaTypeForPath(path);
@@ -3732,15 +4317,13 @@ function apply(ctx, config) {
 					return;
 				}
 				const { sessionId, path } = decoded.ref;
-				const cwd = sessionCwdOf(ctx, sessionId);
-				const absolute = requireAbsolute(path);
-				if (!isWithin(cwd, absolute)) throw new SidebarError("fs-error", "html path outside the session working directory", 403);
+				const absolute = await ensureWorkspacePath(await sessionCwdOf(ctx, sessionId), path);
 				const info = await stat(absolute);
 				if (!info.isFile() || info.size > resolved.mediaLimit) throw new SidebarError("fs-error", "not a file or too large", 400);
 				const type = mediaTypeForPath(absolute);
 				const body = await readFile(absolute);
 				res.writeHead(200, {
-					"content-type": type,
+					"content-type": type === "text/html" ? "text/html; charset=utf-8" : type,
 					"cache-control": "no-cache",
 					"x-content-type-options": "nosniff",
 					"referrer-policy": "no-referrer",
@@ -3778,13 +4361,51 @@ function apply(ctx, config) {
 			});
 		}
 	}), "dsh-better-sidebar: agent-terminals push WebSocket");
+	const agentOpenWss = new WebSocketServer({ noServer: true });
+	ctx.effect(() => ctx.webServer.registerUpgrade({
+		path: "/sidebar/ws/agent-opens",
+		handler: (req, socket, head) => {
+			if (!fence(req)) {
+				socket.destroy();
+				return;
+			}
+			agentOpenWss.handleUpgrade(req, socket, head, (ws) => {
+				attachAgentOpen(agentOpenRegistry, ws, req);
+			});
+		}
+	}), "dsh-better-sidebar: agent-opens push WebSocket");
 	ctx.effect(() => () => {
 		toolsDisposers?.();
+		openToolsDisposers?.();
 		ptyManager?.disposeAll();
 		agentPtyRegistry?.disposeAll();
+		agentOpenRegistry.dispose();
 		wss.close();
 		agentListWss.close();
+		agentOpenWss.close();
 	}, "dsh-better-sidebar: teardown");
+}
+/** Push queued `sidebar_open` requests for one session to a connected view. */
+async function attachAgentOpen(registry, ws, req) {
+	try {
+		const sessionId = new URL(req.url ?? "/", "http://dsh.internal").searchParams.get("sessionId");
+		if (sessionId === null) {
+			ws.close(1008, "sessionId is required");
+			return;
+		}
+		const send = (request) => {
+			if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(request));
+		};
+		const unsubscribe = registry.attach(sessionId, send);
+		ws.on("close", () => {
+			unsubscribe();
+		});
+		ws.on("error", () => {
+			unsubscribe();
+		});
+	} catch (error) {
+		ws.close(1011, error instanceof Error ? error.message : String(error));
+	}
 }
 /** Push the live agent-terminal list for one session to a connected sidebar view. */
 async function attachAgentList(registry, ws, req) {
@@ -3852,7 +4473,7 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 			ws.close(1011, PTY_DEPS_MISSING);
 			return;
 		}
-		const cwd = sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0);
+		const cwd = await sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0);
 		const overrides = shellOverridesOf(getSettings);
 		const handle = ptyManager.open(sessionId, tabId, cwd, 80, 24, overrides.shell, overrides.shellArgs);
 		if (handle.transcript !== "") ws.send(handle.transcript);

@@ -45,6 +45,7 @@ export function TreePanel(props: {
   sessionId: string
   cwd: string | undefined
   expanded: string[]
+  revealed: string[]
   onToggle: (path: string) => void
   onOpenFile: (path: string) => void
   /** File context-menu "open in a new tab" (passed through to FileTree). */
@@ -63,7 +64,7 @@ export function TreePanel(props: {
    *  at a fixed width. */
   full?: boolean
 }) {
-  const { sessionId, cwd, expanded, onToggle, onOpenFile, onOpenFileNewTab, onOpenFileSide, openWithTargets, openWithPinned, openWithSsh, onOpenWith, onToggleOpenWithPin, onReferenceFile, full } = props
+  const { sessionId, cwd, expanded, revealed, onToggle, onOpenFile, onOpenFileNewTab, onOpenFileSide, openWithTargets, openWithPinned, openWithSsh, onOpenWith, onToggleOpenWithPin, onReferenceFile, full } = props
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<{ matches: string[]; truncated: boolean } | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -221,6 +222,7 @@ export function TreePanel(props: {
           sessionId={sessionId}
           cwd={cwd}
           expanded={expanded}
+          revealed={revealed}
           onToggle={onToggle}
           onOpenFile={onOpenFile}
           onOpenFileNewTab={onOpenFileNewTab}

@@ -3,6 +3,7 @@ export declare function TreePanel(props: {
     sessionId: string;
     cwd: string | undefined;
     expanded: string[];
+    revealed: string[];
     onToggle: (path: string) => void;
     onOpenFile: (path: string) => void;
     /** File context-menu "open in a new tab" (passed through to FileTree). */

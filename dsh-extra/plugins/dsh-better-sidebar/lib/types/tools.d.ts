@@ -21,11 +21,14 @@ export declare function boundBytes(text: string, maxBytes: number): {
  * session's terminals.
  * @param ctx - host plugin context (carries the tools service).
  * @param registry - the agent-owned terminal registry.
- * @param resolveCwd - live cwd resolver for one session id.
+ * @param resolveCwd - async cwd resolver for one session id. Resolves through
+ *  the session header, the client-supplied cwd, and the persistence index
+ *  before falling back to the host process cwd (production always provides
+ *  persistence, so the fallback is reached only in tests / stripped-down hosts).
  * @returns a disposer that unregisters all eight tools (the caller gates
  * registration on the side-card setting and calls this to turn them off).
  */
-export declare function registerTools(ctx: Context, registry: AgentPtyRegistry, resolveCwd: (sessionId: string) => string, readShellOverrides: () => {
+export declare function registerTools(ctx: Context, registry: AgentPtyRegistry, resolveCwd: (sessionId: string) => Promise<string>, readShellOverrides: () => {
     shell?: string;
     shellArgs?: string[];
 }): () => void;

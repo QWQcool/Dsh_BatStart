@@ -4,8 +4,9 @@
  * button cluster, and the + menu that opens new tabs (explorer / git /
  * terminal). Tabs are draggable; dropping onto another tab inserts before it,
  * dropping on the strip background appends to this pane. Right-clicking a
- * tab opens the tab context menu (close / close others / close to the left /
- * close to the right, all scoped to this pane).
+ * tab opens the tab context menu (float as a free window / close / close
+ * others / close to the left / close to the right, the close ones scoped to
+ * this pane).
  */
 import { type ReactNode } from 'react';
 import type { SidebarTab } from './state.ts';
@@ -35,6 +36,16 @@ export declare function TabBar(props: {
     newTabOptions: NewTabOption[];
     /** Drop of a tab from any pane: (payload, insertBeforeTabId | null). */
     onDropTab: (payload: TabDragPayload, before: string | null) => void;
+    /** Float a tab out as a free window (the tab context menu's entry; the
+     *  drag-to-conversation gesture is handled at the Sidebar shell level). */
+    onFloatTab: (tabId: string) => void;
+    /**
+     * Pin/unpin a terminal tab (v0.17.0+). Called with `'workspace'` or
+     * `'global'` to pin (the shell snapshots the home cwd), or `null` to
+     * unpin. Non-terminal tabs never trigger this callback. Optional: the
+     * menu hides the pin entry when unset (legacy callers).
+     */
+    onPinTab?: (tabId: string, scope: 'workspace' | 'global' | null) => void;
     /** Icon resolver for tab labels (reads from the tab descriptor registry). */
     getTabIcon?: (tab: SidebarTab) => ReactNode;
     /** Badge resolver for tab labels (reads the descriptor's `badge`; the

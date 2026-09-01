@@ -27,6 +27,18 @@ export interface GitStatusResult {
     isRepo: boolean;
     branch?: string;
     entries: GitStatusEntry[];
+    /** True when the host capped `entries` (huge untracked set); the panel
+     *  shows a truncation notice instead of freezing (#369). */
+    truncated?: boolean;
+    root?: string;
+    repositories?: string[];
+}
+/** One linked Git checkout. */
+export interface GitWorktree {
+    path: string;
+    branch: string;
+    current: boolean;
+    changes: number;
 }
 /** One git log row. */
 export interface GitLogEntry {
@@ -92,6 +104,8 @@ export interface SessionScope {
     sessionId: string;
     /** The session's working directory from the client list summary (optional). */
     cwd?: string;
+    /** Selected Git repository when cwd is a workspace container. */
+    repoRoot?: string;
 }
 /** The sidebar API surface (session scope threaded through every call). */
 export declare const api: {
@@ -122,42 +136,43 @@ export declare const api: {
         path: string;
         size: number;
     }>;
-    gitStatus: (scope: SessionScope, signal?: AbortSignal) => Promise<GitStatusResult>;
-    gitDiff: (scope: SessionScope, path: string | undefined, staged: boolean, signal?: AbortSignal) => Promise<{
+    gitWorktrees: (scope: SessionScope, signal?: AbortSignal) => Promise<GitWorktree[]>;
+    gitStatus: (scope: SessionScope, worktree?: string, signal?: AbortSignal) => Promise<GitStatusResult>;
+    gitDiff: (scope: SessionScope, path: string | undefined, staged: boolean, worktree?: string, signal?: AbortSignal) => Promise<{
         diff: string;
     }>;
-    gitStage: (scope: SessionScope, path?: string) => Promise<{
+    gitStage: (scope: SessionScope, path?: string, worktree?: string) => Promise<{
         ok: true;
     }>;
-    gitUnstage: (scope: SessionScope, path?: string) => Promise<{
+    gitUnstage: (scope: SessionScope, path?: string, worktree?: string) => Promise<{
         ok: true;
     }>;
-    gitCommit: (scope: SessionScope, message: string) => Promise<{
+    gitCommit: (scope: SessionScope, message: string, worktree?: string) => Promise<{
         ok: true;
     }>;
-    gitBranch: (scope: SessionScope, signal?: AbortSignal) => Promise<{
+    gitBranch: (scope: SessionScope, worktree?: string, signal?: AbortSignal) => Promise<{
         current: string;
         names: string[];
     }>;
-    gitCheckout: (scope: SessionScope, branch: string) => Promise<{
+    gitCheckout: (scope: SessionScope, branch: string, worktree?: string) => Promise<{
         ok: true;
     }>;
     /** Recent commit history, lazily pageable (skip/count; defaults 0/30). */
-    gitLog: (scope: SessionScope, count?: number, skip?: number, signal?: AbortSignal) => Promise<GitLogEntry[]>;
+    gitLog: (scope: SessionScope, count?: number, skip?: number, worktree?: string, signal?: AbortSignal) => Promise<GitLogEntry[]>;
     /** Full patch text of one commit (diff display for the history rows). */
-    gitCommitDiff: (scope: SessionScope, hash: string, signal?: AbortSignal) => Promise<{
+    gitCommitDiff: (scope: SessionScope, hash: string, worktree?: string, signal?: AbortSignal) => Promise<{
         diff: string;
     }>;
     /** Discard the worktree changes of one file (the index is untouched). */
-    gitDiscard: (scope: SessionScope, path: string) => Promise<{
+    gitDiscard: (scope: SessionScope, path: string, worktree?: string) => Promise<{
         ok: true;
     }>;
     /** Revert one commit onto the current branch. */
-    gitRevert: (scope: SessionScope, hash: string) => Promise<{
+    gitRevert: (scope: SessionScope, hash: string, worktree?: string) => Promise<{
         ok: true;
     }>;
     /** Cherry-pick one commit onto the current branch. */
-    gitCherryPick: (scope: SessionScope, hash: string) => Promise<{
+    gitCherryPick: (scope: SessionScope, hash: string, worktree?: string) => Promise<{
         ok: true;
     }>;
     /** Release a terminal's process immediately (tab closed; the WS close frame

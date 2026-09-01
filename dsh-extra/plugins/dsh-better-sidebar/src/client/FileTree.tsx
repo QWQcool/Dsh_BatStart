@@ -106,6 +106,8 @@ export function FileTree(props: {
   sessionId: string
   cwd: string | undefined
   expanded: string[]
+  /** Files highlighted by a "Show in folder" reveal (absolute paths). */
+  revealed: string[]
   onToggle: (path: string) => void
   onOpenFile: (path: string) => void
   /** Context-menu "open in a new tab" (file rows; absent → no entry). */
@@ -134,7 +136,7 @@ export function FileTree(props: {
   /** True while an upload is in flight (drops are ignored). */
   busy: boolean
 }) {
-  const { sessionId, cwd, expanded, onToggle, onOpenFile, onOpenFileNewTab, onOpenFileSide, openWithTargets, openWithPinned, openWithSsh, onOpenWith, onToggleOpenWithPin, onReferenceFile, refreshTick, onUploadRequest, busy } = props
+  const { sessionId, cwd, expanded, revealed, onToggle, onOpenFile, onOpenFileNewTab, onOpenFileSide, openWithTargets, openWithPinned, openWithSsh, onOpenWith, onToggleOpenWithPin, onReferenceFile, refreshTick, onUploadRequest, busy } = props
   const [data, setData] = useState<Record<string, LevelData>>({})
   const dataRef = useRef(data)
   /** The row whose path was just copied ("copied" label replaces its button). */
@@ -273,6 +275,16 @@ export function FileTree(props: {
     loadDir(root)
     for (const dir of expanded) loadDir(dir)
   }, [cwd, expanded, refreshTick, loadDir])
+
+  // Bring a "Show in folder" reveal into view: the ancestors expand above
+  // (revealPaths), but the row may not be scrolled into sight — a reveal on
+  // a long tree should surface the highlighted file. Re-runs when the tree
+  // data or reveal set changes (the row appears after its level loads).
+  useEffect(() => {
+    if (revealed.length === 0) return
+    const row = bodyRef.current?.querySelector('[data-dsh-revealed]')
+    row?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }, [revealed, data])
 
   /** Copy `text`; on success flip the row's copied label for a moment. */
   const copyPath = useCallback((text: string, path: string): void => {
@@ -431,7 +443,9 @@ export function FileTree(props: {
               className={clsx(
                 css.explorerRow, css.explorerDir, entry.hidden && css.explorerHidden,
                 dropTarget === entry.path && css.explorerRowDropTarget,
+                revealed.includes(entry.path) && css.explorerRowRevealed,
               )}
+              data-dsh-revealed={revealed.includes(entry.path) ? 'true' : undefined}
               style={{ paddingLeft: depth * 22 + 6 }}
               onClick={() => { onToggle(entry.path) }}
               onKeyDown={(event) => {
@@ -461,7 +475,9 @@ export function FileTree(props: {
           className={clsx(
             css.explorerRow, entry.hidden && css.explorerHidden, entry.broken && css.explorerBroken,
             dropTarget === parentOf(entry.path) && css.explorerRowDropTarget,
+            revealed.includes(entry.path) && css.explorerRowRevealed,
           )}
+          data-dsh-revealed={revealed.includes(entry.path) ? 'true' : undefined}
           style={{ paddingLeft: depth * 22 + 6 }}
           title={entry.broken ? `${entry.path} — ${t('brokenSymlink')}` : entry.path}
           onClick={() => { onOpenFile(entry.path) }}
