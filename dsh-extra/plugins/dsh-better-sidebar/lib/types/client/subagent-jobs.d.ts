@@ -8,6 +8,7 @@
  */
 import type { SidebarSessionList, SidebarJobStatus, SidebarJobView } from '../context-types.ts';
 import type { CopyKey } from './locales.ts';
+import { treeSessionIds } from './subagent-lineage.ts';
 /** One row of the jobs section: the job plus its owning session's title. */
 export interface TreeJob {
     ownerSessionId: string;
@@ -16,21 +17,14 @@ export interface TreeJob {
 }
 /** Whether the registry still holds the job open (its duration ticks). */
 export declare function isJobLive(job: SidebarJobView): boolean;
-/**
- * Every session id of the topology tree rooted at `rootId` (the root plus
- * each session whose uninterrupted subagent-origin chain reaches it — same
- * lineage semantics as {@link countSubagentDescendants}; cycles fail soft).
- * Sessions outside the tree (orphans, other trees) are excluded, so the
- * jobs section never shows foreign work.
- */
-export declare function treeSessionIds(byId: SidebarSessionList['byId'], rootId: string | undefined): Set<string>;
+export { treeSessionIds };
 /**
  * Whether a NEW background job appeared for one session between two
  * consecutive list snapshots (a job id the previous snapshot lacked).
  * Unlike the subagent auto-open (0 → N only), ANY new job id triggers: the
  * agent may start several jobs over a session, and each new one should
- * surface the Jobs page (a fresh page load never triggers — its baseline
- * starts at the current snapshot).
+ * surface the Tasks page containing the background-jobs section (a fresh page
+ * load never triggers — its baseline starts at the current snapshot).
  */
 export declare function detectNewJob(prev: SidebarSessionList, next: SidebarSessionList, sessionId: string): boolean;
 /**

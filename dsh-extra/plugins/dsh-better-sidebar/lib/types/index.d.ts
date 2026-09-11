@@ -45,3 +45,12 @@ export interface SidebarSettingsFace {
  * {@link resolveSidebarConfig}.
  */
 export declare function apply(ctx: Context, config?: SidebarConfig): void;
+/**
+ * The WS close reason for a failed terminal attach. A missing configured
+ * shell gets a SHORT machine-readable marker (`shell-not-found:<name>`,
+ * capped by BYTES — a WS close reason allows at most 123 bytes, which `ws`
+ * validates with `Buffer.byteLength`) that the client maps to a localized,
+ * actionable banner; every other failure keeps the raw message (the
+ * model-side tool errors read it verbatim).
+ */
+export declare function wsCloseReasonOf(error: unknown): string;

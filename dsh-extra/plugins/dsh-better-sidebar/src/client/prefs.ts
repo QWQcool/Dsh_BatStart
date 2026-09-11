@@ -12,7 +12,6 @@ import type { api } from './api.ts'
 import {
   clampTerminalFontSize,
   clampTitleBarStrip,
-  clampWidthPercent,
   SIDEBAR_PREFS_DEFAULTS,
   TITLE_BAR_SCHEMES,
   TITLE_BAR_STRIP_DEFAULT,
@@ -26,7 +25,6 @@ export {
   TITLE_BAR_STRIP_DEFAULT,
   clampTerminalFontSize,
   clampTitleBarStrip,
-  clampWidthPercent,
 }
 export type { SidebarPrefs, TitleBarScheme }
 
@@ -43,12 +41,6 @@ export function parsePrefs(value: unknown): SidebarPrefs {
   if (value === null || typeof value !== 'object') return { ...SIDEBAR_PREFS_DEFAULTS }
   const record = value as Record<string, unknown>
   return {
-    openByDefault: typeof record.openByDefault === 'boolean'
-      ? record.openByDefault
-      : SIDEBAR_PREFS_DEFAULTS.openByDefault,
-    defaultWidthPercent: typeof record.defaultWidthPercent === 'number' && Number.isFinite(record.defaultWidthPercent)
-      ? clampWidthPercent(record.defaultWidthPercent)
-      : SIDEBAR_PREFS_DEFAULTS.defaultWidthPercent,
     autoOpenSubagent: typeof record.autoOpenSubagent === 'boolean'
       ? record.autoOpenSubagent
       : SIDEBAR_PREFS_DEFAULTS.autoOpenSubagent,
@@ -76,12 +68,12 @@ export function parsePrefs(value: unknown): SidebarPrefs {
     terminalFontSize: typeof record.terminalFontSize === 'number' && Number.isFinite(record.terminalFontSize)
       ? clampTerminalFontSize(record.terminalFontSize)
       : SIDEBAR_PREFS_DEFAULTS.terminalFontSize,
-    interceptOpenPath: typeof record.interceptOpenPath === 'boolean'
-      ? record.interceptOpenPath
-      : SIDEBAR_PREFS_DEFAULTS.interceptOpenPath,
     editorExplorer: typeof record.editorExplorer === 'boolean'
       ? record.editorExplorer
       : SIDEBAR_PREFS_DEFAULTS.editorExplorer,
+    workspaceFence: typeof record.workspaceFence === 'boolean'
+      ? record.workspaceFence
+      : SIDEBAR_PREFS_DEFAULTS.workspaceFence,
     // The title-bar scheme (auto | web | preset | custom). The schema
     // declares the field WITHOUT a default, so documents written by older
     // plugin versions resolve without it — migrate from the legacy fields:
@@ -209,5 +201,24 @@ export async function loadExternalDisable(settings: SidebarSettingsClient): Prom
     return view.externalDisable === true
   } catch {
     return false
+  }
+}
+
+/** The boot decision both the prefs and the external-disable flag need:
+ *  ONE settings fetch answers both (the boot path used to await
+ *  {@link loadPrefs} and {@link loadExternalDisable} serially — two round
+ *  trips of the same document before the first paint, and the second had no
+ *  timeout, so a stalled wire could keep the sidebar unmounted forever). */
+export interface BootDecision {
+  prefs: SidebarPrefs
+  suspended: boolean
+}
+
+export async function loadBootDecision(settings: SidebarSettingsClient): Promise<BootDecision> {
+  try {
+    const view = await settings.settingsGet()
+    return { prefs: parsePrefs(view.value), suspended: view.externalDisable === true }
+  } catch {
+    return { prefs: { ...SIDEBAR_PREFS_DEFAULTS }, suspended: false }
   }
 }

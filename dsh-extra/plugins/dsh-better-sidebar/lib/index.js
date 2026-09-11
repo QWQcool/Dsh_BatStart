@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
-import { mkdir, open, opendir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { access, lstat, mkdir, open, opendir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import z from "schemastery";
 import { createHash, randomUUID } from "node:crypto";
@@ -8,11 +8,12 @@ import { once } from "node:events";
 import { chmodSync, createWriteStream, existsSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { SettingsConflictError, settingsNamespace } from "@deepseek-ai/dsh-settings";
+import { SettingsConflictError } from "@deepseek-ai/dsh-settings";
 import { homedir, userInfo } from "node:os";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { snapshotSubagentDescriptor } from "@deepseek-ai/dsh-subagent";
+import { SessionLogOffset } from "@deepseek-ai/dsh-session";
 //#region src/prefs-shared.ts
 /**
 * Shared "Side card" preference vocabulary (types + constants), consumed by
@@ -25,8 +26,6 @@ import { snapshotSubagentDescriptor } from "@deepseek-ai/dsh-subagent";
 const SIDEBAR_PREFS_NS = "dsh-better-sidebar";
 /** Fallback prefs used whenever the settings document is unreachable or malformed. */
 const SIDEBAR_PREFS_DEFAULTS = {
-	openByDefault: false,
-	defaultWidthPercent: 35,
 	autoOpenSubagent: true,
 	autoOpenJobs: true,
 	agentTerminalTools: false,
@@ -34,8 +33,8 @@ const SIDEBAR_PREFS_DEFAULTS = {
 	bottomPanelAutoTerminal: true,
 	terminalFontFamily: "",
 	terminalFontSize: 13,
-	interceptOpenPath: true,
 	editorExplorer: false,
+	workspaceFence: true,
 	terminalShell: "",
 	terminalShellArgs: "",
 	titleBarScheme: "auto",
@@ -93,8 +92,6 @@ function resolveSidebarConfig(config) {
 }
 /** Schemastery schema for the user-facing preferences (validated by the settings service). */
 const PrefsSchema = z.object({
-	openByDefault: z.boolean().default(false),
-	defaultWidthPercent: z.number().step(1).min(20).max(60).default(35),
 	autoOpenSubagent: z.boolean().default(true),
 	autoOpenJobs: z.boolean().default(true),
 	agentTerminalTools: z.boolean().default(false),
@@ -102,8 +99,8 @@ const PrefsSchema = z.object({
 	bottomPanelAutoTerminal: z.boolean().default(true),
 	terminalFontFamily: z.string().default(""),
 	terminalFontSize: z.number().step(1).min(9).max(32).default(13),
-	interceptOpenPath: z.boolean().default(true),
 	editorExplorer: z.boolean().default(false),
+	workspaceFence: z.boolean().default(true),
 	terminalShell: z.string().default(""),
 	terminalShellArgs: z.string().default(""),
 	titleBarScheme: z.union([
@@ -133,10 +130,12 @@ const PrefsSchema = z.object({
 var SidebarError = class extends Error {
 	code;
 	status;
-	constructor(code, message, status = 400) {
+	meta;
+	constructor(code, message, status = 400, meta) {
 		super(message);
 		this.code = code;
 		this.status = status;
+		this.meta = meta;
 	}
 };
 /** Body size bound of one JSON request (defense against unbounded reads). */
@@ -321,6 +320,34 @@ function messageOf(error) {
 	return error instanceof Error ? error.message : String(error);
 }
 //#endregion
+//#region src/session-path.ts
+/** `\\wsl.localhost\<distro>` root of a Windows-hosted WSL workspace. */
+const WSL_LOCALHOST_ROOT = /^\\\\wsl\.localhost\\([^\\]+)(?:\\|$)/i;
+/**
+* Reinterpret an already-absolute path in the namespace of one session.
+*
+* Windows treats `/foo` as rooted on the current drive, so `path.resolve()`
+* turns it into e.g. `C:\\foo`. That is wrong for a session whose cwd is a
+* WSL UNC path: in that namespace `/foo` means the distro's Linux `/foo`.
+* Project only that unambiguous combination onto the matching distro root;
+* drive paths, UNC paths, ordinary Windows sessions and non-Windows hosts
+* keep their existing semantics.
+*
+* Workspace containment is intentionally NOT handled here. A projected path
+* such as `/tmp/x` can still be rejected later for lying outside the session
+* workspace; the important part is that it is checked as WSL `/tmp/x`, not
+* silently redirected to `C:\\tmp\\x`.
+*/
+function resolveSessionPath(cwd, target, platform = process.platform) {
+	if (platform !== "win32" || !/^\/(?!\/)/.test(target)) return target;
+	const normalizedCwd = cwd.replace(/\//g, "\\");
+	const match = WSL_LOCALHOST_ROOT.exec(normalizedCwd);
+	if (match === null) return target;
+	const distroRoot = `\\\\wsl.localhost\\${match[1]}`;
+	const relative = target.slice(1).replace(/\//g, "\\");
+	return win32.resolve(distroRoot, relative);
+}
+//#endregion
 //#region src/path-security.ts
 /** Filesystem path guards shared by sidebar APIs that access a session workspace. */
 /** Resolve a path and convert filesystem resolution failures to an API error. */
@@ -336,16 +363,20 @@ function assertWithinWorkspace(workspace, target) {
 	if (!isWithin(workspace, target)) throw new SidebarError("forbidden", `path "${target}" is outside workspace`, 403);
 }
 /**
-* Resolve an existing workspace path through symlinks and enforce containment.
+* Resolve an existing workspace path through symlinks and (unless disarmed)
+* enforce containment.
 *
 * @param cwd - Session workspace directory.
-* @param target - Client-supplied absolute path.
+* @param target - Client-supplied absolute path in the session's namespace.
+* @param fence - Whether containment is enforced (the settings-page
+* `workspaceFence` switch). Even when false the paths are still resolved
+* through symlinks so callers always receive the canonical target.
 * @returns The canonical absolute path used for the filesystem operation.
 */
-async function ensureWorkspacePath(cwd, target) {
-	const absolute = requireAbsolute(target);
+async function ensureWorkspacePath(cwd, target, fence = true) {
+	const absolute = requireAbsolute(resolveSessionPath(cwd, target));
 	const [realCwd, realTarget] = await Promise.all([resolveRealPath(cwd, "workspace"), resolveRealPath(absolute, "target")]);
-	assertWithinWorkspace(realCwd, realTarget);
+	if (fence) assertWithinWorkspace(realCwd, realTarget);
 	return realTarget;
 }
 /**
@@ -356,17 +387,19 @@ async function ensureWorkspacePath(cwd, target) {
 * symlink is never left in the path passed to the write operation.
 *
 * @param cwd - Session workspace directory.
-* @param target - Client-supplied absolute destination path.
+* @param target - Client-supplied absolute destination path in the session's namespace.
+* @param fence - Whether containment is enforced (the settings-page
+* `workspaceFence` switch). Resolution/canonicalization is identical either way.
 * @returns A canonical path for an existing target or its nearest existing ancestor.
 */
-async function ensureWorkspaceWritePath(cwd, target) {
-	const absolute = requireAbsolute(target);
+async function ensureWorkspaceWritePath(cwd, target, fence = true) {
+	const absolute = requireAbsolute(resolveSessionPath(cwd, target));
 	const realCwd = await resolveRealPath(cwd, "workspace");
 	let existingPath = absolute;
 	const missingSegments = [];
 	for (;;) try {
 		const realTarget = await realpath(existingPath);
-		assertWithinWorkspace(realCwd, realTarget);
+		if (fence) assertWithinWorkspace(realCwd, realTarget);
 		return missingSegments.reduce((path, segment) => join(path, segment), realTarget);
 	} catch (error) {
 		if (error.code !== "ENOENT") {
@@ -392,6 +425,13 @@ async function ensureWorkspaceWritePath(cwd, target) {
 * to a uniquely named temp sibling
 * and are renamed into place, so a failed, aborted, or oversized upload never
 * leaves a partial file at the target path.
+*
+* The tree's rename/delete (below) are link-aware: existence and containment
+* are verified against the fully resolved target (a symlink pointing outside
+* the workspace is refused while the fence is armed), but the operation
+* itself addresses the lexical row path — renaming or deleting a symlink
+* row renames/unlinks the LINK, never its target, matching what the tree
+* row visually names (VS Code semantics).
 */
 /**
 * Stream `chunks` into `dir/relativePath` atomically: a uniquely named temp
@@ -405,14 +445,14 @@ async function ensureWorkspaceWritePath(cwd, target) {
 * failures; the temp file is always removed on failure.
 */
 async function writeWorkspaceUpload(input) {
-	const { cwd, dir, relativePath, chunks, limit } = input;
+	const { cwd, dir, relativePath, chunks, limit, fence = true } = input;
 	const base = requireAbsolute(dir);
-	await ensureWorkspacePath(cwd, base);
+	await ensureWorkspacePath(cwd, base, fence);
 	if (relativePath === "" || relativePath.startsWith("/") || relativePath.startsWith("\\")) throw new SidebarError("bad-request", "relativePath must stay below the upload directory", 400);
 	const segments = relativePath.split(/[\\/]/);
 	if (segments.some((part) => part === "" || part === "." || part === "..")) throw new SidebarError("bad-request", "relativePath must stay below the upload directory", 400);
 	const target = join(base, ...segments);
-	const safeTarget = await ensureWorkspaceWritePath(cwd, target);
+	const safeTarget = await ensureWorkspaceWritePath(cwd, target, fence);
 	const tmp = join(dirname(safeTarget), `.${basename(safeTarget)}.dsh-upload-${randomUUID()}.tmp`);
 	await mkdir(dirname(safeTarget), { recursive: true });
 	const stream = createWriteStream(tmp, { flags: "wx" });
@@ -447,6 +487,82 @@ async function writeWorkspaceUpload(input) {
 		await rm(tmp, { force: true }).catch(() => {});
 		throw error;
 	}
+}
+/** Resolve one existing entry for a link-aware mutation: the lexical row path
+* plus its fully resolved real target (fence-checked). ENOENT becomes an
+* fs-error, mirroring path-security's resolveRealPath semantics. */
+async function resolveEntry(cwd, target, fence) {
+	const absolute = requireAbsolute(resolveSessionPath(cwd, target));
+	let real;
+	let realCwd;
+	try {
+		[realCwd, real] = await Promise.all([realpath(cwd), realpath(absolute)]);
+	} catch (error) {
+		throw new SidebarError("fs-error", `cannot resolve "${target}": ${error instanceof Error ? error.message : String(error)}`, 400);
+	}
+	if (fence && !isWithin(realCwd, real)) throw new SidebarError("forbidden", `path "${target}" is outside workspace`, 403);
+	return {
+		absolute,
+		real,
+		realCwd
+	};
+}
+/** Whether a path exists (ENOENT → false; other failures propagate). */
+async function pathExists(target) {
+	try {
+		await access(target);
+		return true;
+	} catch (error) {
+		if (error.code === "ENOENT") return false;
+		throw error;
+	}
+}
+/**
+* Rename one tree row within its directory: `path` → `<parent>/<name>`.
+* The new name must be a single path segment (this is rename, not move);
+* an existing destination is refused (POSIX rename would clobber it
+* silently); the workspace root itself is never renamable; a symlink row
+* renames the link, not its target. A no-op rename (same name) succeeds
+* without touching the filesystem.
+*
+* @throws SidebarError with a wire code for shape, containment, existence
+* and root failures.
+*/
+async function renameWorkspaceEntry(input) {
+	const { cwd, path, name, fence = true } = input;
+	if (name === "" || name === "." || name === ".." || name.includes("/") || name.includes("\\")) throw new SidebarError("bad-request", "name must be a single path segment", 400);
+	const { absolute, real, realCwd } = await resolveEntry(cwd, path, fence);
+	if (real === realCwd) throw new SidebarError("fs-error", "cannot rename the workspace root", 400);
+	if (basename(absolute) === name) return { path: absolute };
+	const safeDestination = await ensureWorkspaceWritePath(cwd, join(dirname(absolute), name), fence);
+	if (await pathExists(safeDestination)) throw new SidebarError("fs-error", `"${name}" already exists`, 409);
+	try {
+		await rename(absolute, safeDestination);
+	} catch (error) {
+		throw new SidebarError("fs-error", `cannot rename "${path}" to "${name}": ${error instanceof Error ? error.message : String(error)}`, 400);
+	}
+	return { path: safeDestination };
+}
+/**
+* Delete one tree row permanently (there is no trash on the host): files are
+* unlinked, directories removed recursively, a symlink row unlinks the LINK
+* only (lstat decides, so a link to a directory does not recurse into its
+* target). The workspace root itself is never removable.
+*
+* @throws SidebarError with a wire code for containment, existence and
+* root failures.
+*/
+async function removeWorkspaceEntry(input) {
+	const { cwd, path, fence = true } = input;
+	const { absolute, real, realCwd } = await resolveEntry(cwd, path, fence);
+	if (real === realCwd) throw new SidebarError("fs-error", "cannot remove the workspace root", 400);
+	try {
+		if ((await lstat(absolute)).isDirectory()) await rm(absolute, { recursive: true });
+		else await unlink(absolute);
+	} catch (error) {
+		throw new SidebarError("fs-error", `cannot remove "${path}": ${error instanceof Error ? error.message : String(error)}`, 400);
+	}
+	return { path: absolute };
 }
 //#endregion
 //#region src/fs-search.ts
@@ -697,7 +813,8 @@ function isTrustedApiRequest(request, trustedHosts) {
 const CHUNK_NAMES = [
 	"terminal",
 	"editor",
-	"mermaid"
+	"mermaid",
+	"locale"
 ];
 /** Directory of this host-half module (lib/ — the chunk scripts live next to it). */
 const LIB_DIR = dirname(fileURLToPath(import.meta.url));
@@ -813,7 +930,7 @@ function revealCommand(path, platform = process.platform) {
 		};
 		case "win32": return {
 			command: "explorer.exe",
-			args: ["/select,", path]
+			args: [`/select,${path}`]
 		};
 		default: return {
 			command: "xdg-open",
@@ -1126,16 +1243,37 @@ function pathIdentity(path) {
 	const absolute = resolve(path).replace(/[\\/]+$/, "");
 	return process.platform === "win32" ? absolute.toLowerCase() : absolute;
 }
+/** Whether the current Git binary supports NUL-framed `worktree list` output.
+* Git < 2.36 rejects `-z`; cache the capability after the first attempt so
+* the SCM panel's polling does not repeatedly spawn a command known to fail. */
+let worktreeListSupportsZ;
 /** Raw usable checkout records, shared by inventory and target validation.
 * Prunable records point at missing paths and are deliberately excluded from
 * both the selector and the command-target allowlist. */
 async function listedWorktrees(cwd) {
-	return parseWorktreeList(await runGit(cwd, [
+	let raw;
+	if (worktreeListSupportsZ === false) raw = await runGit(cwd, [
 		"worktree",
 		"list",
-		"--porcelain",
-		"-z"
-	])).filter((entry) => !entry.prunable);
+		"--porcelain"
+	]);
+	else try {
+		raw = await runGit(cwd, [
+			"worktree",
+			"list",
+			"--porcelain",
+			"-z"
+		]);
+		worktreeListSupportsZ = true;
+	} catch {
+		worktreeListSupportsZ = false;
+		raw = await runGit(cwd, [
+			"worktree",
+			"list",
+			"--porcelain"
+		]);
+	}
+	return parseWorktreeList(raw).filter((entry) => !entry.prunable);
 }
 /** All linked checkouts of the repository containing `cwd`, enriched with a
 * live change count. The current checkout is first so a single-worktree repo
@@ -1545,12 +1683,13 @@ var PtyManager = class {
 		if (existing !== void 0) this.close(key);
 		for (const [candidate, handle] of [...this.sessions]) if (handle.sessionId === sessionId && handle.exited) this.close(candidate);
 		if (this.keysOf(sessionId).length >= this.maxPerSession) throw new SidebarError("pty-error", `terminal limit reached (${this.maxPerSession}) for this session`, 400);
+		const executable = resolveShellExecutable(shell ?? this.shell);
 		const handle = {
 			key,
 			sessionId,
 			tabId,
 			cwd,
-			pty: this.nodePty.spawn(shell ?? this.shell, shellSpawnArgs(shellArgs ?? this.shellArgs), {
+			pty: this.nodePty.spawn(executable, shellSpawnArgs(shellArgs ?? this.shellArgs), {
 				name: "xterm-256color",
 				cols: Math.max(2, Math.floor(cols)),
 				rows: Math.max(2, Math.floor(rows)),
@@ -1637,6 +1776,15 @@ var PtyManager = class {
 		for (const key of [...this.sessions.keys()]) this.close(key);
 	}
 };
+/** Read one Windows environment value case-insensitively. Real
+* `process.env` has case-insensitive lookup on Windows, but injected objects
+* and some embedders do not preserve that behavior. */
+function windowsEnv(env, name) {
+	const direct = env[name];
+	if (direct !== void 0) return direct;
+	const lowered = name.toLowerCase();
+	for (const [key, value] of Object.entries(env)) if (key.toLowerCase() === lowered) return value;
+}
 /**
 * Candidate directories that may contain a `pwsh.exe` on Windows: PATH
 * entries first, then the well-known machine/user install locations
@@ -1648,17 +1796,17 @@ var PtyManager = class {
 */
 function windowsPwshCandidateDirs(env) {
 	const dirs = [];
-	const pathEntries = env.PATH;
+	const pathEntries = windowsEnv(env, "PATH");
 	if (pathEntries !== void 0) for (const entry of pathEntries.split(";")) {
 		const trimmed = entry.trim();
 		if (trimmed !== "") dirs.push(trimmed);
 	}
-	for (const programFiles of [env.ProgramW6432, env.ProgramFiles]) {
+	for (const programFiles of [windowsEnv(env, "ProgramW6432"), windowsEnv(env, "ProgramFiles")]) {
 		if (programFiles === void 0 || programFiles.trim() === "") continue;
 		dirs.push(join(programFiles, "PowerShell", "7"));
 		dirs.push(join(programFiles, "PowerShell", "7-preview"));
 	}
-	const localAppData = env.LOCALAPPDATA;
+	const localAppData = windowsEnv(env, "LOCALAPPDATA");
 	if (localAppData !== void 0 && localAppData.trim() !== "") {
 		dirs.push(join(localAppData, "Microsoft", "PowerShell", "7"));
 		dirs.push(join(localAppData, "Microsoft", "PowerShell", "7-preview"));
@@ -1666,6 +1814,58 @@ function windowsPwshCandidateDirs(env) {
 		dirs.push(join(localAppData, "Programs", "PowerShell", "7-preview"));
 	}
 	return [...new Set(dirs)];
+}
+/**
+* Resolve the configured shell executable before handing it to node-pty.
+*
+* POSIX and Windows are both probed BEFORE spawn so a wrong configured name
+* becomes a stable, actionable `shell-not-found` error instead of a bare
+* "[process exited with code N]" (POSIX execvp) or an opaque native string
+* (Windows). Windows' native backend additionally does not consistently
+* apply the shell's PATHEXT lookup to a bare value (`pwsh` / `cmd` can fail
+* with the opaque `File not found:` error), so perform the lookup ourselves:
+*
+* - an explicit path is accepted as-is when it exists (or with a PATHEXT
+*   suffix when the user omitted `.exe`),
+* - a bare name is searched through PATH, System32, and PowerShell's known
+*   install directories,
+* - failure becomes a stable, actionable `shell-not-found` error instead of
+*   a native backend string with no mention of the configured shell.
+*/
+function resolveShellExecutable(shell, options = {}) {
+	const configured = unquotePath(shell.trim());
+	const platform = options.platform ?? process.platform;
+	if (configured === "") return configured;
+	const env = options.env ?? process.env;
+	const exists = options.exists ?? existsSync;
+	const notFound = () => new SidebarError("shell-not-found", `shell executable not found: "${configured}"`, 400, { shell: configured });
+	if (platform === "win32") {
+		const executableExts = (windowsEnv(env, "PATHEXT") ?? ".COM;.EXE").split(";").map((extension) => extension.trim()).filter((extension) => /^\.(?:com|exe)$/i.test(extension));
+		if (executableExts.length === 0) executableExts.push(".EXE", ".COM");
+		const names = win32.extname(configured) !== "" ? [configured] : executableExts.map((extension) => configured + extension.toLowerCase());
+		const hasPath = win32.isAbsolute(configured) || /[\\/]/.test(configured);
+		const candidates = [];
+		if (hasPath) candidates.push(...names);
+		else {
+			const path = windowsEnv(env, "PATH");
+			if (path !== void 0) for (const dir of path.split(";").map((entry) => entry.trim()).filter(Boolean)) for (const name of names) candidates.push(win32.join(dir, name));
+			const systemRoot = windowsEnv(env, "SystemRoot");
+			if (systemRoot !== void 0 && systemRoot.trim() !== "") for (const name of names) candidates.push(win32.join(systemRoot, "System32", name));
+			if (/^pwsh(?:\.exe)?$/i.test(configured)) for (const dir of windowsPwshCandidateDirs(env)) candidates.push(win32.join(dir, "pwsh.exe"));
+		}
+		for (const candidate of [...new Set(candidates)]) if (exists(candidate)) return candidate;
+		throw notFound();
+	}
+	if (configured.includes("/")) {
+		if (!exists(configured)) throw notFound();
+		return configured;
+	}
+	const path = env.PATH ?? "/usr/bin:/bin";
+	for (const dir of path.split(":").map((entry) => entry.trim()).filter(Boolean)) {
+		const candidate = join(dir, configured);
+		if (exists(candidate)) return candidate;
+	}
+	throw notFound();
 }
 /**
 * The interactive shell for this platform, resolved like a terminal
@@ -1729,6 +1929,60 @@ function shellSpawnArgs(configured = []) {
 	if (configured.length > 0) return [...configured];
 	return process.platform === "win32" ? [] : ["-l"];
 }
+/**
+* Strip ONE pair of surrounding quotes from a configured shell path. Users
+* paste Windows paths with spaces pre-quoted (`"C:\Program Files\…"`); the
+* quotes are shell-input syntax, not part of the path. Unpaired quotes and
+* shorter values stay verbatim.
+*/
+function unquotePath(value) {
+	if (value.length >= 2) {
+		const first = value[0];
+		const last = value[value.length - 1];
+		if (first === "\"" && last === "\"" || first === "'" && last === "'") return value.slice(1, -1);
+	}
+	return value;
+}
+/**
+* Split a settings-page shell-arguments string into argv with quote-aware
+* grouping: `'…'` / `"…"` group whitespace, and characters inside quotes are
+* LITERAL — a backslash is never an escape, so Windows paths survive intact
+* (`-File "C:\my init\init.ps1"` → three tokens, the last containing spaces).
+* The price is that an argument containing a literal quote character cannot
+* be expressed; shell startup arguments never need one. An unclosed quote
+* folds the remainder into the current token (settings input stays
+* forgiving); an empty quote pair yields no argument.
+*/
+function splitShellArgs(input) {
+	const args = [];
+	let current = "";
+	let quote = null;
+	let started = false;
+	for (const ch of input) {
+		if (quote !== null) {
+			if (ch === quote) quote = null;
+			else current += ch;
+			continue;
+		}
+		if (ch === "\"" || ch === "'") {
+			quote = ch;
+			started = true;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (started) {
+				args.push(current);
+				current = "";
+				started = false;
+			}
+			continue;
+		}
+		current += ch;
+		started = true;
+	}
+	if (started) args.push(current);
+	return args.filter((arg) => arg !== "");
+}
 //#endregion
 //#region src/agent-pty.ts
 /**
@@ -1764,6 +2018,61 @@ function clampDims(cols, rows) {
 		rows: clamp(rows)
 	};
 }
+/**
+* node-pty's Windows terminal queues resize calls that arrive before the
+* ConPTY control socket's first data flush (`_deferNoArgs` in
+* windowsTerminal.js). If the pty exits before the queue flushes, the
+* deferred resize throws inside the socket's 'data' handler — uncatchable
+* by any caller and fatal to the host process. POSIX terminals have no such
+* queue (resize is synchronous), so the gate is armed on Windows only:
+* {@link tryResizePty} parks dims requested before the first output and
+* replays them after the flush, when node-pty executes resizes
+* synchronously (and the throw for an exited pty is catchable).
+*/
+const ptyResizeGates = /* @__PURE__ */ new WeakMap();
+/**
+* Arm the Windows pre-ready resize gate for one freshly spawned pty.
+* No-op on POSIX and for injected ptys without `onData`.
+*/
+function armPtyResizeGate(pty) {
+	if (process.platform !== "win32") return;
+	if (typeof pty.onData !== "function" || ptyResizeGates.has(pty)) return;
+	const state = { sawData: false };
+	ptyResizeGates.set(pty, state);
+	pty.onData(() => {
+		if (state.sawData) return;
+		state.sawData = true;
+		const dims = state.pending;
+		state.pending = void 0;
+		if (dims === void 0) return;
+		setImmediate(() => {
+			tryResizePty(pty, dims.cols, dims.rows);
+		});
+	});
+}
+/**
+* Best-effort resize for WebSocket-driven terminal views. Layout animation
+* can briefly produce unusable dimensions, and node-pty can reject a resize
+* after the socket setup's outer try/catch has returned. Ignore that one
+* frame so the host stays alive and a later valid measurement can retry.
+* Returns whether node-pty accepted the resize (or parked it for replay on
+* the first output — the Windows pre-ready window).
+*/
+function tryResizePty(pty, cols, rows) {
+	if (!Number.isFinite(cols) || !Number.isFinite(rows)) return false;
+	const dims = clampDims(cols, rows);
+	const gate = ptyResizeGates.get(pty);
+	if (gate !== void 0 && !gate.sawData) {
+		gate.pending = dims;
+		return true;
+	}
+	try {
+		pty.resize(dims.cols, dims.rows);
+		return true;
+	} catch {
+		return false;
+	}
+}
 /** Map a POSIX signal number to its conventional name (best-effort). */
 const SIGNAL_NAMES = {
 	1: "SIGHUP",
@@ -1786,20 +2095,54 @@ function signalNameOf(signal) {
 	if (signal === null || signal === void 0) return null;
 	return SIGNAL_NAMES[signal] ?? `signal ${signal}`;
 }
-/** Locate the first occurrence of `needle` in `transcript`, returning its line/column. */
-function locateNeedle(transcript, needle) {
+/**
+* Compile a wait needle into a RegExp. The needle is treated as a JavaScript
+* regular expression; a pattern that fails to compile ( e.g. an unbalanced
+* group typed as a literal ) degrades to verbatim substring matching so
+* legacy literal needles keep working.
+*/
+function compileNeedle(needle) {
+	try {
+		return new RegExp(needle);
+	} catch {
+		return null;
+	}
+}
+/**
+* Locate the first occurrence of `needle` in `transcript`, returning its
+* line/column plus the actual matched text — for alternation patterns
+* ( e.g. `(BUILD_OK|BUILD_FAIL)` ) the match tells which alternative hit.
+* `re` is the precompiled form of `needle` (from {@link compileNeedle});
+* `null` means verbatim substring matching.
+*/
+function locateNeedle(transcript, needle, re) {
 	if (needle === "") return void 0;
-	const idx = transcript.indexOf(needle);
-	if (idx === -1) return void 0;
+	let hit;
+	if (re !== null) {
+		re.lastIndex = 0;
+		const m = re.exec(transcript);
+		hit = m === null ? void 0 : {
+			index: m.index,
+			text: m[0]
+		};
+	} else {
+		const idx = transcript.indexOf(needle);
+		hit = idx === -1 ? void 0 : {
+			index: idx,
+			text: needle
+		};
+	}
+	if (hit === void 0) return void 0;
 	let line = 0;
 	let lineStart = 0;
-	for (let i = 0; i < idx; i += 1) if (transcript.charCodeAt(i) === 10) {
+	for (let i = 0; i < hit.index; i += 1) if (transcript.charCodeAt(i) === 10) {
 		line += 1;
 		lineStart = i + 1;
 	}
 	return {
 		line,
-		column: idx - lineStart
+		column: hit.index - lineStart,
+		match: hit.text
 	};
 }
 /** Snapshot projection of a handle (drops the pty reference and transcript). */
@@ -1845,13 +2188,15 @@ var AgentPtyRegistry = class {
 	create(sessionId, title, command, cwd, cols = 80, rows = 24, shell, shellArgs) {
 		const uuid = randomUUID();
 		const dims = clampDims(cols, rows);
-		const pty = this.nodePty.spawn(shell ?? this.shell, shellSpawnArgs(shellArgs ?? this.shellArgs), {
+		const executable = resolveShellExecutable(shell ?? this.shell);
+		const pty = this.nodePty.spawn(executable, shellSpawnArgs(shellArgs ?? this.shellArgs), {
 			name: "xterm-256color",
 			cols: dims.cols,
 			rows: dims.rows,
 			cwd,
 			env: { ...process.env }
 		});
+		armPtyResizeGate(pty);
 		const handle = {
 			uuid,
 			sessionId,
@@ -1944,7 +2289,7 @@ var AgentPtyRegistry = class {
 	resize(uuid, cols, rows) {
 		const handle = this.expect(uuid);
 		const dims = clampDims(cols, rows);
-		if (!handle.exited) handle.pty.resize(dims.cols, dims.rows);
+		if (!handle.exited) tryResizePty(handle.pty, dims.cols, dims.rows);
 		return dims;
 	}
 	/**
@@ -1967,7 +2312,12 @@ var AgentPtyRegistry = class {
 	* make event-driven wakeups unreliable. A 50ms poll is fast enough for
 	* interactive use and simple enough to be obviously correct.
 	* @param uuid - terminal to watch.
-	* @param needle - substring to search for (case-sensitive, verbatim).
+	* @param needle - JavaScript regular expression to search for
+	*   (case-sensitive); a pattern that fails to compile falls back to
+	*   verbatim substring matching. May cover several outcomes at once
+	*   ( e.g. `(BUILD_OK|BUILD_FAIL)` for build success vs failure ) — the
+	*   returned `match` reports the text that actually matched, so callers
+	*   can tell which outcome hit.
 	* @param timeoutMs - max wait; default 10000 (10s). Clamped to ≥100ms.
 	* @param signal - caller-owned cancellation; aborts the wait re-throwing.
 	* @returns one of `found` / `timeout` / `exited`.
@@ -1978,18 +2328,20 @@ var AgentPtyRegistry = class {
 		const timeout = Math.max(100, Math.floor(timeoutMs));
 		const start = Date.now();
 		const deadline = start + timeout;
+		const re = compileNeedle(needle);
 		if (handle.exited) return {
 			kind: "exited",
 			needle,
 			exitCode: handle.exitCode ?? null,
 			exitSignal: signalNameOf(handle.exitSignal)
 		};
-		const firstHit = locateNeedle(handle.transcript, needle);
+		const firstHit = locateNeedle(handle.transcript, needle, re);
 		if (firstHit !== void 0) return {
 			kind: "found",
 			needle,
 			line: firstHit.line,
 			column: firstHit.column,
+			match: firstHit.match,
 			elapsedMs: Date.now() - start
 		};
 		while (true) {
@@ -2000,12 +2352,13 @@ var AgentPtyRegistry = class {
 				exitCode: handle.exitCode ?? null,
 				exitSignal: signalNameOf(handle.exitSignal)
 			};
-			const hit = locateNeedle(handle.transcript, needle);
+			const hit = locateNeedle(handle.transcript, needle, re);
 			if (hit !== void 0) return {
 				kind: "found",
 				needle,
 				line: hit.line,
 				column: hit.column,
+				match: hit.match,
 				elapsedMs: Date.now() - start
 			};
 			if (Date.now() >= deadline) return {
@@ -2393,7 +2746,7 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 	}));
 	register(defineTool({
 		name: "terminal_wait_for",
-		description: "Block until a substring appears in a terminal's retained transcript, or until the timeout elapses, or until the terminal exits — whichever happens first. Use this to synchronize on command completion cues ( e.g. a shell prompt, \"done\", \"Listening on\", \"Build successful\" ) without busy-polling terminal_read. The wait scans the FULL retained transcript (up to ~1 MiB) on every poll, so a needle that scrolled past the most recent chunk is still a match. Returns `found` with the line/column of the first occurrence, `timeout` if the needle did not appear in time, or `exited` if the terminal process died before the needle appeared. Default timeout is 10 seconds; raise it for long-running commands ( dev servers, test suites ). The wait is cooperative: a tool-call cancel ( or agent turn end ) aborts it immediately.",
+		description: "Block until a pattern appears in a terminal's retained transcript, or until the timeout elapses, or until the terminal exits — whichever happens first. Use this to synchronize on command completion cues ( e.g. a shell prompt, \"done\", \"Listening on\", \"Build successful\" ) without busy-polling terminal_read. The needle is a JavaScript regular expression ( a pattern that fails to compile falls back to verbatim substring matching ). One needle may cover MULTIPLE outcomes — e.g. wait on `(BUILD_OK|BUILD_FAIL)` or `Build (succeeded|failed)` returns as soon as EITHER marker appears, and the found result's `match` field tells which alternative hit ( build success vs failure ). The wait scans the FULL retained transcript (up to ~1 MiB) on every poll, so a needle that scrolled past the most recent chunk is still a match. Returns `found` with the line/column and the matched text, `timeout` if the needle did not appear in time, or `exited` if the terminal process died before the needle appeared. Default timeout is 10 seconds; raise it for long-running commands ( dev servers, test suites ). The wait is cooperative: a tool-call cancel ( or agent turn end ) aborts it immediately.",
 		parameters: {
 			uuid: {
 				type: "string",
@@ -2403,7 +2756,7 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 			needle: {
 				type: "string",
 				required: true,
-				description: "Substring to wait for (case-sensitive, verbatim). Must be non-empty."
+				description: "JavaScript regular expression to wait for (case-sensitive); a pattern that fails to compile falls back to verbatim substring matching. May cover several outcomes in one wait ( e.g. `(BUILD_OK|BUILD_FAIL)` for build success/failure ) — check `match` in the found result to see which one hit. Must be non-empty."
 			},
 			timeout_ms: {
 				type: "number",
@@ -2434,6 +2787,11 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 							type: "integer",
 							required: true,
 							description: "0-based column index within that line where the match starts."
+						},
+						match: {
+							type: "string",
+							required: true,
+							description: "The text that actually matched — for multi-outcome patterns ( e.g. `(BUILD_OK|BUILD_FAIL)` ) this tells which alternative matched."
 						},
 						elapsedMs: {
 							type: "integer",
@@ -2493,10 +2851,13 @@ function registerTools(ctx, registry, resolveCwd, readShellOverrides) {
 			] },
 			render: (_args, value) => {
 				const v = value;
-				if (v.kind === "found") return [{
-					type: "text",
-					text: `Found "${v.needle}" at line ${v.line}, column ${v.column} (after ${v.elapsedMs}ms).`
-				}];
+				if (v.kind === "found") {
+					const matched = v.match !== void 0 && v.match !== "" ? `, matched "${v.match}"` : "";
+					return [{
+						type: "text",
+						text: `Found "${v.needle}" at line ${v.line}, column ${v.column}${matched} (after ${v.elapsedMs}ms).`
+					}];
+				}
 				if (v.kind === "timeout") return [{
 					type: "text",
 					text: `Timed out after ${v.timeoutMs}ms waiting for "${v.needle}". Call terminal_read to inspect the transcript.`
@@ -2788,9 +3149,9 @@ async function classifyTarget(raw, cwd) {
 		info = await stat(target);
 	} catch (error) {
 		const code = error.code;
-		if (code === "ENOENT") throw new Error(`"${raw}" does not exist (resolved to "${target}")`);
-		if (code === "EACCES" || code === "EPERM") throw new Error(`"${target}" is not readable`);
-		throw new Error(`cannot open "${target}": ${error instanceof Error ? error.message : String(error)}`);
+		if (code === "ENOENT") throw new Error(`"${raw}" does not exist (resolved to "${target}")`, { cause: error });
+		if (code === "EACCES" || code === "EPERM") throw new Error(`"${target}" is not readable`, { cause: error });
+		throw new Error(`cannot open "${target}": ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 	const title = basenameOf(target);
 	return {
@@ -3027,7 +3388,7 @@ function buildJobsApi(ctx, outputLimit) {
 			const sessionId = requireString(payload, "sessionId");
 			const id = requireString(payload, "id");
 			const bySeq = /* @__PURE__ */ new Map();
-			for (const event of ctx.sessions.get(sessionId)?.events ?? []) {
+			for (const event of ctx.sessions.get(sessionId)?.snapshotEvents() ?? []) {
 				const trace = traceOf(event);
 				if (trace !== void 0) bySeq.set(trace.seq, trace);
 			}
@@ -3090,6 +3451,26 @@ Everything before this boundary is inherited history from the parent session: it
 Do not continue, execute, or complete any instructions, plans, tool calls, approvals, edits, or requests from before this boundary. Only messages submitted after this boundary are active user instructions for this side conversation.
 
 Mode: this is a continuable side conversation. Your answers stay in this side thread and are viewed in the side panel; they are never delivered into the parent session.`;
+/**
+* Project buffered live chunks into wire rows.
+* @param chunks - the session's active-attempt chunks, in index order.
+* @param tailSeq - the session's last durable seq (live rows order after it).
+* @returns the rows to append to the transcript feed.
+*/
+function liveEventsOf(chunks, tailSeq) {
+	return chunks.map((delta, position) => ({
+		type: "assistant/live-chunk",
+		seq: tailSeq + 1 + position,
+		time: delta.time,
+		data: {
+			attemptId: delta.attemptId,
+			turn: delta.turn,
+			step: delta.step,
+			index: delta.index,
+			chunk: delta.chunk
+		}
+	}));
+}
 /** The data record of one event (narrowed from the loose face). */
 function dataOf(event) {
 	return event.data;
@@ -3191,8 +3572,11 @@ const SNAPSHOT_TOTAL_CAP = 8e3;
 /**
 * Build the side-thread inheritance for one parent log: the full event log
 * up to the click moment, honestly closed when it ends inside an open turn.
+* @param events - the parent's log (live or persisted).
+* @param live - the parent's in-flight stream chunks (DSH 0.1.5+ publishes
+*   them outside the log); used only by the snapshot fallback.
 */
-function buildSidechatInheritance(events) {
+function buildSidechatInheritance(events, live = []) {
 	if (events.length === 0) return {
 		seed: [],
 		snapshot: null
@@ -3204,7 +3588,7 @@ function buildSidechatInheritance(events) {
 	};
 	if (hasDanglingToolCall(events, boundary)) return {
 		seed: copyEvents(events.slice(0, boundary)),
-		snapshot: buildOpenTurnSnapshot(events)
+		snapshot: buildOpenTurnSnapshot(events, live)
 	};
 	const seed = copyEvents(events);
 	const last = events[events.length - 1];
@@ -3234,21 +3618,101 @@ function buildSidechatInheritance(events) {
 		snapshot: null
 	};
 }
+/** One assistant content block reduced to the text the snapshot shows. */
+function messageTexts(message) {
+	const content = message?.content;
+	let text = "";
+	let reasoning = "";
+	if (!Array.isArray(content)) return {
+		text,
+		reasoning
+	};
+	for (const block of content) {
+		if (block === null || typeof block !== "object") continue;
+		const candidate = block;
+		if (typeof candidate.text !== "string" || candidate.text === "") continue;
+		if (candidate.type === "text") text += candidate.text;
+		else if (candidate.type === "reasoning") reasoning += candidate.text;
+	}
+	return {
+		text,
+		reasoning
+	};
+}
+/**
+* Expand one attempt's compact `AssistantStreamRecord[]` (the durable stream
+* DSH 0.1.5 embeds in `assistant/message.stream` and `assistant/attempt.stream`)
+* into the text/reasoning it carried. Tool-call records contribute no text.
+*/
+function streamTexts(stream) {
+	let text = "";
+	let reasoning = "";
+	if (!Array.isArray(stream)) return {
+		text,
+		reasoning
+	};
+	for (const record of stream) {
+		if (record === null || typeof record !== "object") continue;
+		const entry = record;
+		if (entry.type === "text-chunks" || entry.type === "reasoning-chunks") {
+			if (!Array.isArray(entry.texts)) continue;
+			const joined = entry.texts.filter((part) => typeof part === "string").join("");
+			if (entry.type === "text-chunks") text += joined;
+			else reasoning += joined;
+			continue;
+		}
+		if (entry.type === "chunk") {
+			const chunk = entry.chunk;
+			if (chunk === null || typeof chunk !== "object" || typeof chunk.text !== "string") continue;
+			if (chunk.type === "text-delta") text += chunk.text;
+			else if (chunk.type === "reasoning-delta") reasoning += chunk.text;
+		}
+	}
+	return {
+		text,
+		reasoning
+	};
+}
+/** One live delta's contribution to the snapshot. */
+function liveTexts(chunk) {
+	if (typeof chunk.text !== "string" || chunk.text === "") return {
+		text: "",
+		reasoning: ""
+	};
+	if (chunk.type === "text-delta") return {
+		text: chunk.text,
+		reasoning: ""
+	};
+	if (chunk.type === "reasoning-delta") return {
+		text: "",
+		reasoning: chunk.text
+	};
+	return {
+		text: "",
+		reasoning: ""
+	};
+}
 /**
 * Structured text snapshot of the parent's OPEN turn (from its `turn/start`
-* to the log tail): the accumulated assistant/reasoning output verbatim
-* (code blocks ride the raw deltas) and the tool activity — executed tools
-* with their result text, the still-executing one marked. Returns null when
-* there is no open turn or nothing to show.
+* to the log tail): the assistant/reasoning output so far and the tool
+* activity — executed tools with their result text, the still-executing one
+* marked. Returns null when there is no open turn or nothing to show.
+*
+* The in-flight step's text is NOT in the log on DSH 0.1.5 (the model stream
+* is process-local until it settles), so it comes from `live`; settled steps
+* read their durable `assistant/message` content, and a failed attempt reads
+* its embedded `assistant/attempt.stream`.
+* @param events - the parent's log.
+* @param live - the parent's in-flight stream chunks, in index order.
 */
-function buildOpenTurnSnapshot(events) {
+function buildOpenTurnSnapshot(events, live = []) {
 	const boundary = lastTurnBoundary(events);
 	if (boundary < 0 || events[boundary]?.type !== "turn/start") return null;
+	const openTurn = numberAt(dataOf(events[boundary]), "turn");
 	let text = "";
 	let reasoning = "";
 	const tools = [];
 	const pendingCalls = /* @__PURE__ */ new Map();
-	let total = 0;
 	for (let index = boundary + 1; index < events.length; index++) {
 		const event = events[index];
 		if (event === void 0) continue;
@@ -3257,11 +3721,16 @@ function buildOpenTurnSnapshot(events) {
 			pendingCalls.clear();
 			continue;
 		}
-		if (event.type === "assistant/chunk") {
-			const chunk = data.chunk;
-			if (chunk === null || typeof chunk !== "object") continue;
-			if (chunk.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
-			else if (chunk.type === "reasoning-delta" && typeof chunk.text === "string") reasoning += chunk.text;
+		if (event.type === "assistant/message") {
+			const settled = messageTexts(data.message);
+			text += settled.text;
+			reasoning += settled.reasoning;
+			continue;
+		}
+		if (event.type === "assistant/attempt") {
+			const attempt = streamTexts(data.stream);
+			text += attempt.text;
+			reasoning += attempt.reasoning;
 			continue;
 		}
 		if (event.type === "tool/call") {
@@ -3282,13 +3751,17 @@ function buildOpenTurnSnapshot(events) {
 			const failed = data.error !== void 0;
 			const line = [`- \`${name ?? "tool"}\`${failed ? " (failed)" : ""}` + (args !== void 0 && args !== "" ? ` — arguments: \`${args}\`` : ""), ...result === "" ? [] : [`  Result: ${result}`]].join("\n");
 			tools.push(line);
-			total += line.length;
 		}
 	}
 	for (const [, call] of pendingCalls) {
 		const line = `- \`${call.name}\` (executing) — arguments: \`${call.args}\``;
 		tools.push(line);
-		total += line.length;
+	}
+	for (const delta of live) {
+		if (delta.turn !== openTurn) continue;
+		const contribution = liveTexts(delta.chunk);
+		text += contribution.text;
+		reasoning += contribution.reasoning;
 	}
 	const sections = [];
 	if (text.trim() !== "") sections.push(`Assistant output so far:\n\n${text}`);
@@ -3324,6 +3797,13 @@ function messageLeadText(data) {
 	const content = data.content;
 	const first = Array.isArray(content) ? content[0] : content;
 	return typeof first === "string" ? first : typeof first === "object" && first !== null && "text" in first ? String(first.text) : "";
+}
+/** The events a thread produced itself: everything after the LAST
+*  `session/end-seed` marker (the fork-seed boundary). A log with no marker
+*  (a thread created before seeding existed) is returned whole. */
+function threadOwnLogEvents(events) {
+	for (let index = events.length - 1; index >= 0; index--) if (events[index]?.type === "session/end-seed") return events.slice(index + 1);
+	return [...events];
 }
 /**
 * The agent preset a session actually runs: newest `agent-preset/selected`
@@ -3361,9 +3841,11 @@ function contentText(content) {
 }
 /**
 * Fold a session event log into the last text output + last tool call (each
-* is the LAST occurrence in event order). Lifecycle events and raw
-* `assistant/chunk` rows are ignored — the card shows what the subagent is
-* doing right now, not its plumbing. The scan runs BACKWARD from the newest
+* is the LAST occurrence in event order). Lifecycle events and raw stream
+* rows are ignored — the card shows what the subagent is doing right now,
+* not its plumbing. (DSH 0.1.5 publishes the raw deltas as process-local
+* frames instead of log events, so only the assembled `assistant/message`
+* reaches this scan.) The scan runs BACKWARD from the newest
 * event and stops once both fields are found, so a long history costs only
 * the recent tail in the common case.
 * @param events - the session's append-only event log (oldest → newest).
@@ -3422,7 +3904,7 @@ function buildSubagentLiveApi(ctx) {
 			if (entry.kind !== "child" || entry.activity !== "running") continue;
 			if (entry.label?.startsWith("Side: ") ?? false) continue;
 			try {
-				const activity = lastActivity(ctx.sessions.get(entry.id)?.events ?? [], 12);
+				const activity = lastActivity(ctx.sessions.get(entry.id)?.snapshotEvents() ?? [], 12);
 				if (activity.text !== void 0 || activity.tool !== void 0) live[entry.id] = activity;
 			} catch {}
 		}
@@ -3430,10 +3912,32 @@ function buildSubagentLiveApi(ctx) {
 	} };
 }
 //#endregion
+//#region src/session-store.ts
+/**
+* Read one persisted session's header and full event log.
+* @param persistence - the live `sessionPersistence` service.
+* @param sessionId - the stored session to read.
+* @returns the header and log; rejects when the session does not exist.
+*/
+async function readPersistedSession(persistence, sessionId) {
+	const handle = await persistence.open(sessionId, "read");
+	try {
+		const { events } = await handle.read();
+		return {
+			header: handle.header,
+			events,
+			inheritedEventCount: handle.inheritedEventCount ?? 0
+		};
+	} finally {
+		await handle.close();
+	}
+}
+//#endregion
 //#region src/sidechat-routes.ts
 /**
 * Side Chat routes of the /sidebar JSON API ('sidechat.start' /
-* 'sidechat.prompt' / 'sidechat.cancel' / 'sidechat.dispose').
+* 'sidechat.prompt' / 'sidechat.cancel' / 'sidechat.dispose' /
+* 'sidechat.info' / 'sidechat.events').
 *
 * A side thread is a child session the plugin creates ITSELF with a custom
 * seed — the parent's full event log up to the click moment, honestly closed
@@ -3456,6 +3960,11 @@ function buildSubagentLiveApi(ctx) {
 /** Timeout guarding the create call (the registry detaches it before the
 *  handle becomes visible, so the child is never cancelled by it). */
 const CREATE_TIMEOUT_MS = 15e3;
+/** Head cap of one `sidechat.events` response (the ceiling the old
+*  client-side walk could load: 40 pages × 200 events). A pathological
+*  thread beyond it renders its tail window — the same degradation the
+*  capped walk had, never a failed poll. */
+const EVENTS_CAP = 8e3;
 /** Per-activation disposers of created thread agents (the dispose route
 *  releases them; the session and its history always stay persisted). */
 const threadDisposers = /* @__PURE__ */ new Map();
@@ -3482,8 +3991,8 @@ async function composeChildSetup(ctx, presetId) {
 async function composePersistedSetup(ctx, childId) {
 	const persistence = ctx.get("sessionPersistence");
 	if (persistence === void 0) return () => Promise.resolve();
-	const inspected = await persistence.inspect(childId);
-	const presetId = resolvePresetId(inspected.meta, inspected.events);
+	const inspected = await readPersistedSession(persistence, childId);
+	const presetId = resolvePresetId(inspected.header, inspected.events);
 	const presets = ctx.get("agentPresets");
 	if (presets === void 0 || presetId === void 0) return () => Promise.resolve();
 	const resolved = await presets.resolve(presetId);
@@ -3532,10 +4041,36 @@ function admitFirstContact(agent, injectionText, question) {
 function liveThreadAgent(ctx, childId) {
 	return ctx.get("agents")?.get(childId);
 }
+/**
+* The thread's event log (seed + its own events, already expanded): the live
+* agent's in-memory log while the thread is attached — the freshest read,
+* including events not yet flushed — else the persisted logical log. Both
+* DSH generations expose these seams with the same shape (the 0.1.2
+* persistence layer packs chunk rows on disk but expands them on inspect;
+* the live log is `Session.snapshotEvents()`, the 0.1.2-alpha.4 rename of
+* the `Session.events` property), which is why the transcript reads here
+* instead of the client's session-history RPC: that face
+* (`ctx.connection.api`) was removed in 0.1.2-alpha.1's Remote-gateway
+* migration.
+*/
+async function threadLogEvents(ctx, childId) {
+	const agent = liveThreadAgent(ctx, childId);
+	if (agent !== void 0) return agent.session.snapshotEvents();
+	const persistence = ctx.get("sessionPersistence");
+	if (persistence === void 0) throw new SidebarError("sidechat-error", "the session persistence service is unavailable", 503);
+	try {
+		return (await readPersistedSession(persistence, childId)).events;
+	} catch (error) {
+		throw new SidebarError("not-found", `thread "${childId}" is not available: ${error instanceof Error ? error.message : String(error)}`, 404);
+	}
+}
 /** Build the Side Chat routes (all optional services degrade to a wire
 *  error the tab surfaces inline). The record keys are the FULL wire method
-*  names the /sidebar/api dispatcher looks up (`api[method]`). */
-function buildSidechatApi(ctx) {
+*  names the /sidebar/api dispatcher looks up (`api[method]`).
+*  @param ctx - host plugin context.
+*  @param live - the live assistant stream buffer; absent only in tests that
+*    never exercise streaming (then every `live` response is empty). */
+function buildSidechatApi(ctx, live) {
 	return {
 		"sidechat.start": async (payload) => {
 			const sessionId = requireString(payload, "sessionId");
@@ -3544,8 +4079,8 @@ function buildSidechatApi(ctx) {
 			const parent = liveThreadAgent(ctx, sessionId);
 			if (parent === void 0) throw new SidebarError("sidechat-error", `parent session "${sessionId}" is not running`, 409);
 			const parentSession = parent.session;
-			const inheritance = buildSidechatInheritance(parentSession.events);
-			const { agentPreset, setup } = await composeChildSetup(ctx, resolvePresetId(parentSession.header, parentSession.events));
+			const inheritance = buildSidechatInheritance(parentSession.snapshotEvents(), live?.chunksFor(sessionId) ?? []);
+			const { agentPreset, setup } = await composeChildSetup(ctx, resolvePresetId(parentSession.header, parentSession.snapshotEvents()));
 			const childId = `session-${randomUUID()}`;
 			const label = question === "" ? SIDE_NEW_THREAD_TITLE : sideLabel(question);
 			const descriptor = snapshotSubagentDescriptor({
@@ -3567,12 +4102,13 @@ function buildSidechatApi(ctx) {
 				meta: {
 					...parentSession.header.cwd === void 0 ? {} : { cwd: parentSession.header.cwd },
 					parentSession: parentSession.id,
-					seedLength: seed.length,
+					isSeeded: true,
 					origin: "subagent",
 					delegationDepth: (parentSession.header.delegationDepth ?? 0) + 1,
 					...agentPreset === void 0 ? {} : { agentPreset }
 				},
 				seed,
+				inheritedEventCount: SessionLogOffset(seed.length),
 				agentOptions: { ...parent.options },
 				setup,
 				signal: AbortSignal.timeout(CREATE_TIMEOUT_MS)
@@ -3624,7 +4160,7 @@ function buildSidechatApi(ctx) {
 					throw new SidebarError("sidechat-error", `thread resume failed: ${error instanceof Error ? error.message : String(error)}`, 500);
 				}
 			}
-			if (boundaryDelivered(agent.session.events)) admitFollowup(agent, textPrompt(text));
+			if (boundaryDelivered(agent.session.snapshotEvents())) admitFollowup(agent, textPrompt(text));
 			else {
 				const parts = [SIDE_BOUNDARY_PROMPT];
 				const snapshot = pendingSnapshots.get(childId);
@@ -3670,14 +4206,113 @@ function buildSidechatApi(ctx) {
 			}
 			const persistence = ctx.get("sessionPersistence");
 			if (persistence !== void 0) try {
-				const inspected = await persistence.inspect(childId);
-				const preset = resolvePresetId(inspected.meta, inspected.events);
+				const inspected = await readPersistedSession(persistence, childId);
+				const preset = resolvePresetId(inspected.header, inspected.events);
 				return {
 					live: false,
 					...preset === void 0 ? {} : { preset }
 				};
 			} catch {}
 			return { live: false };
+		},
+		"sidechat.events": async (payload) => {
+			const childId = requireString(payload, "childId");
+			const rawAfter = payload.afterSeq;
+			if (rawAfter !== void 0 && (typeof rawAfter !== "number" || !Number.isSafeInteger(rawAfter) || rawAfter < 0)) throw new SidebarError("bad-request", "afterSeq must be a non-negative integer");
+			const own = threadOwnLogEvents(await threadLogEvents(ctx, childId));
+			const fresh = rawAfter === void 0 ? own : own.filter((event) => event.seq > rawAfter);
+			const tailSeq = own.at(-1)?.seq ?? -1;
+			return {
+				events: fresh.length > EVENTS_CAP ? fresh.slice(fresh.length - EVENTS_CAP) : fresh,
+				live: liveEventsOf(live?.chunksFor(childId) ?? [], tailSeq)
+			};
+		}
+	};
+}
+//#endregion
+//#region src/assistant-live.ts
+/** Per-attempt buffer ceiling; beyond it the oldest deltas are dropped. */
+const LIVE_CHUNK_CAP = 4e3;
+/** A frame's `chunk` payload must be a JSON record to be worth buffering. */
+function chunkOf(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? value : void 0;
+}
+/** A finite non-negative integer, or undefined. */
+function countOf(value) {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : void 0;
+}
+/**
+* Fold `agent/assistant-stream` frames into per-session live buffers.
+*
+* Frames arrive for every attached agent, so the buffer is keyed by the
+* emitting session and ignores anything it cannot identify. An out-of-order
+* or mismatched chunk drops the attempt rather than splicing a gap: a
+* transcript with a hole is worse than one that settles at the next durable
+* event.
+* @param ctx - host plugin context (its `on` subscribes the session feed).
+* @param cap - per-attempt chunk ceiling.
+* @returns the read face and a disposer unbinding the listener.
+*/
+function createAssistantLiveBuffer(ctx, cap = LIVE_CHUNK_CAP) {
+	const attempts = /* @__PURE__ */ new Map();
+	const off = ctx.on("agent/assistant-stream", (payload) => {
+		const record = payload;
+		const frame = record?.frame;
+		if (frame === void 0) return;
+		const session = (record?.agent)?.session;
+		const sessionId = typeof session?.id === "string" ? session.id : void 0;
+		if (sessionId === void 0) return;
+		const type = frame["type"];
+		if (type === "end") {
+			attempts.delete(sessionId);
+			return;
+		}
+		const attemptId = typeof frame["attemptId"] === "string" ? frame.attemptId : void 0;
+		if (attemptId === void 0) return;
+		if (type === "start") {
+			const turn = countOf(frame["turn"]);
+			const step = countOf(frame["step"]);
+			if (turn === void 0 || step === void 0) return;
+			const known = attempts.has(sessionId);
+			attempts.delete(sessionId);
+			if (!known && attempts.size >= 64) {
+				const oldest = attempts.keys().next().value;
+				if (oldest !== void 0) attempts.delete(oldest);
+			}
+			attempts.set(sessionId, {
+				attemptId,
+				turn,
+				step,
+				chunks: [],
+				nextIndex: 0
+			});
+			return;
+		}
+		if (type !== "chunk") return;
+		const attempt = attempts.get(sessionId);
+		if (attempt === void 0 || attempt.attemptId !== attemptId) return;
+		const index = countOf(frame["index"]);
+		const chunk = chunkOf(frame["chunk"]);
+		if (index === void 0 || chunk === void 0 || index !== attempt.nextIndex) {
+			attempts.delete(sessionId);
+			return;
+		}
+		attempt.nextIndex = index + 1;
+		const time = countOf(frame["time"]) ?? 0;
+		attempt.chunks.push({
+			attemptId,
+			turn: attempt.turn,
+			step: attempt.step,
+			index,
+			time,
+			chunk
+		});
+		if (attempt.chunks.length > cap) attempt.chunks.splice(0, attempt.chunks.length - cap);
+	});
+	return {
+		chunksFor: (sessionId) => attempts.get(sessionId)?.chunks ?? [],
+		dispose: () => {
+			off();
 		}
 	};
 }
@@ -3751,7 +4386,7 @@ async function sessionCwdOf(ctx, sessionId, clientCwd) {
 	}
 	const persistence = ctx.get("sessionPersistence");
 	if (persistence !== void 0) {
-		const metaCwd = (await persistence.inspect(sessionId)).meta.cwd;
+		const metaCwd = (await readPersistedSession(persistence, sessionId)).header.cwd;
 		if (metaCwd !== void 0 && metaCwd !== "") try {
 			return requireAbsolute(metaCwd);
 		} catch {
@@ -3773,7 +4408,7 @@ function selectedRepoOf(payload) {
 * cwd when the root cannot be resolved, e.g. a bare directory).
 */
 async function resolveGitPath(cwd, raw, selected) {
-	if (isAbsolute(raw)) return requireAbsolute(raw);
+	if (isAbsolute(raw)) return requireAbsolute(resolveSessionPath(cwd, raw));
 	const sessionPath = requireAbsolute(join(cwd, raw));
 	if (await stat(sessionPath).then(() => true).catch(() => false)) return sessionPath;
 	const root = await repoRoot(cwd, selected).catch(() => cwd);
@@ -3823,12 +4458,23 @@ function shellOverridesOf(getSettings) {
 	const value = getSettings()?.get().value;
 	if (value === null || typeof value !== "object") return {};
 	const record = value;
-	const shell = typeof record.terminalShell === "string" ? record.terminalShell.trim() : "";
+	const shell = typeof record.terminalShell === "string" ? unquotePath(record.terminalShell.trim()) : "";
 	const args = typeof record.terminalShellArgs === "string" ? record.terminalShellArgs.trim() : "";
 	return {
 		shell: shell === "" ? void 0 : shell,
-		shellArgs: args === "" ? void 0 : args.split(/\s+/).filter(Boolean)
+		shellArgs: args === "" ? void 0 : splitShellArgs(args)
 	};
+}
+/**
+* Whether the workspace fence is armed for the sidebar's filesystem routes
+* (the settings-page `workspaceFence` switch under the files card's gear).
+* An absent settings service or a missing field keeps the fence ON — the
+* containment default never depends on the settings surface being reachable.
+*/
+function fenceEnabledOf(getSettings) {
+	const value = getSettings()?.get().value;
+	if (value === null || typeof value !== "object") return true;
+	return value.workspaceFence !== false;
 }
 /**
 * Parse the browser tab's `browserAllowedLoopback` allowlist into a matcher
@@ -3847,7 +4493,7 @@ function parseLoopbackAllowlist(allowlist) {
 		return port !== "" && hosts.has(host);
 	};
 }
-function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, getSettings) {
+function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, getSettings, assistantLive) {
 	const cwdOf = async (payload) => {
 		const sessionId = requireString(payload, "sessionId");
 		const record = payload;
@@ -3881,7 +4527,7 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 		},
 		"fs.tree": async (payload) => {
 			const { cwd } = await cwdOf(payload);
-			return listDirectory(payload.path === void 0 ? cwd : await ensureWorkspacePath(cwd, requireString(payload, "path")), resolved.listLimit);
+			return listDirectory(payload.path === void 0 ? cwd : await ensureWorkspacePath(cwd, requireString(payload, "path"), fenceEnabledOf(getSettings)), resolved.listLimit);
 		},
 		"fs.search": async (payload) => {
 			const { cwd } = await cwdOf(payload);
@@ -3890,7 +4536,7 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 		"fs.read": async (payload) => {
 			const { cwd } = await cwdOf(payload);
 			const selected = selectedRepoOf(payload);
-			const { content, truncated, binary, size, head } = await readText(await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, "path"), selected)), resolved.readLimit);
+			const { content, truncated, binary, size, head } = await readText(await ensureWorkspacePath(cwd, await resolveGitPath(cwd, requireString(payload, "path"), selected), fenceEnabledOf(getSettings)), resolved.readLimit);
 			if (binary) return {
 				kind: "binary",
 				size,
@@ -3905,7 +4551,7 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 		},
 		"fs.write": async (payload) => {
 			const { cwd } = await cwdOf(payload);
-			const path = await ensureWorkspaceWritePath(cwd, requireString(payload, "path"));
+			const path = await ensureWorkspaceWritePath(cwd, requireString(payload, "path"), fenceEnabledOf(getSettings));
 			const content = requireString(payload, "content");
 			const tmp = `${path}.dsh-sidebar-tmp-${process.pid}`;
 			try {
@@ -3917,6 +4563,23 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 				throw new SidebarError("fs-error", `cannot write "${path}": ${error instanceof Error ? error.message : String(error)}`, 400);
 			}
 			return { ok: true };
+		},
+		"fs.rename": async (payload) => {
+			const { cwd } = await cwdOf(payload);
+			return renameWorkspaceEntry({
+				cwd,
+				path: requireString(payload, "path"),
+				name: requireString(payload, "name"),
+				fence: fenceEnabledOf(getSettings)
+			});
+		},
+		"fs.remove": async (payload) => {
+			const { cwd } = await cwdOf(payload);
+			return removeWorkspaceEntry({
+				cwd,
+				path: requireString(payload, "path"),
+				fence: fenceEnabledOf(getSettings)
+			});
 		},
 		"git.worktrees": async (payload) => {
 			const { cwd } = await gitCwdOf(payload);
@@ -3985,8 +4648,32 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 		"git.show": async (payload) => {
 			const { cwd } = await gitCwdOf(payload);
 			const repoRoot = selectedRepoOf(payload);
-			const path = await resolveGitPath(cwd, requireString(payload, "path"), repoRoot);
+			const path = requireString(payload, "path");
 			return { content: await show(cwd, requireString(payload, "rev"), path, repoRoot) };
+		},
+		"changes.ops": async (payload) => {
+			const sessionId = requireString(payload, "sessionId");
+			const rawAfter = payload?.afterSeq;
+			if (rawAfter !== void 0 && (typeof rawAfter !== "number" || !Number.isSafeInteger(rawAfter) || rawAfter < 0)) throw new SidebarError("bad-request", "afterSeq must be a non-negative integer");
+			const afterSeq = rawAfter ?? -1;
+			let events = ctx.sessions.get(sessionId)?.snapshotEvents();
+			if (events === void 0) {
+				const persistence = ctx.get("sessionPersistence");
+				if (persistence !== void 0) try {
+					events = (await readPersistedSession(persistence, sessionId)).events;
+				} catch {}
+			}
+			if (events === void 0) return {
+				events: [],
+				lastSeq: Math.max(afterSeq, 0)
+			};
+			const CHANGES_EVENTS_CAP = 4e3;
+			const filtered = events.filter((event) => (event.type === "tool/call" || event.type === "tool/result") && event.seq > afterSeq);
+			const window = filtered.length > CHANGES_EVENTS_CAP ? filtered.slice(filtered.length - CHANGES_EVENTS_CAP) : filtered;
+			return {
+				events: window,
+				lastSeq: window.at(-1)?.seq ?? afterSeq
+			};
 		},
 		"pty.close": (payload) => {
 			const sessionId = requireString(payload, "sessionId");
@@ -4003,10 +4690,13 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 		"jobs.output": (payload) => jobsApi.output(payload),
 		"jobs.kill": (payload) => jobsApi.kill(payload),
 		"subagents.live": (payload) => subagentLiveApi.live(payload),
-		"shell.get": () => ({
-			shell: terminalShell,
-			name: shellDisplayName(terminalShell)
-		}),
+		"shell.get": () => {
+			const effective = shellOverridesOf(getSettings).shell ?? terminalShell;
+			return {
+				shell: effective,
+				name: shellDisplayName(effective)
+			};
+		},
 		"settings.get": () => {
 			const settings = getSettings();
 			return settings === void 0 ? {
@@ -4090,7 +4780,7 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, ge
 			if (action === "url") return launchExternal("url", requireString(payload, "url"));
 			throw new SidebarError("bad-request", "action must be \"reveal\" or \"url\"");
 		},
-		...buildSidechatApi(ctx)
+		...buildSidechatApi(ctx, assistantLive)
 	};
 }
 /**
@@ -4130,7 +4820,7 @@ function apply(ctx, config) {
 		}
 	};
 	ctx.inject(["settings"], (sctx) => {
-		const ns = settingsNamespace(SIDEBAR_PREFS_NS);
+		const ns = SIDEBAR_PREFS_NS;
 		const scope = sctx.settings.register(ns, PrefsSchema);
 		const viewOf = () => {
 			const descriptor = sctx.settings.describe({ redactSecrets: true }).find((candidate) => candidate.ns === ns);
@@ -4172,7 +4862,11 @@ function apply(ctx, config) {
 			syncOpenToolsGate();
 		});
 	});
-	const api = buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, () => settingsFace);
+	const assistantLive = createAssistantLiveBuffer(ctx);
+	ctx.effect(() => () => {
+		assistantLive.dispose();
+	}, "dsh-better-sidebar: live assistant stream buffer");
+	const api = buildApi(ctx, ptyManager, agentPtyRegistry, resolved, terminalShell, () => settingsFace, assistantLive);
 	ctx.effect(() => ctx.webServer.register({
 		kind: "prefix",
 		path: "/sidebar/api",
@@ -4248,7 +4942,8 @@ function apply(ctx, config) {
 					dir,
 					relativePath,
 					chunks: req,
-					limit: resolved.uploadLimit
+					limit: resolved.uploadLimit,
+					fence: fenceEnabledOf(() => settingsFace)
 				});
 				writeOk(res, {
 					path,
@@ -4279,7 +4974,7 @@ function apply(ctx, config) {
 				const sessionId = url.searchParams.get("sessionId");
 				const raw = url.searchParams.get("path");
 				if (sessionId === null || raw === null) throw new SidebarError("bad-request", "sessionId and path are required");
-				const path = await ensureWorkspacePath(await sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0), raw);
+				const path = await ensureWorkspacePath(await sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0), raw, fenceEnabledOf(() => settingsFace));
 				const info = await stat(path);
 				if (!info.isFile() || info.size > resolved.mediaLimit) throw new SidebarError("fs-error", "not a file or too large", 400);
 				const type = mediaTypeForPath(path);
@@ -4317,7 +5012,7 @@ function apply(ctx, config) {
 					return;
 				}
 				const { sessionId, path } = decoded.ref;
-				const absolute = await ensureWorkspacePath(await sessionCwdOf(ctx, sessionId), path);
+				const absolute = await ensureWorkspacePath(await sessionCwdOf(ctx, sessionId), path, fenceEnabledOf(() => settingsFace));
 				const info = await stat(absolute);
 				if (!info.isFile() || info.size > resolved.mediaLimit) throw new SidebarError("fs-error", "not a file or too large", 400);
 				const type = mediaTypeForPath(absolute);
@@ -4431,6 +5126,33 @@ async function attachAgentList(registry, ws, req) {
 	}
 }
 /**
+* The WS close reason for a failed terminal attach. A missing configured
+* shell gets a SHORT machine-readable marker (`shell-not-found:<name>`,
+* capped by BYTES — a WS close reason allows at most 123 bytes, which `ws`
+* validates with `Buffer.byteLength`) that the client maps to a localized,
+* actionable banner; every other failure keeps the raw message (the
+* model-side tool errors read it verbatim).
+*/
+function wsCloseReasonOf(error) {
+	if (error instanceof SidebarError && error.code === "shell-not-found") return `shell-not-found:${truncateUtf8Bytes(shellDisplayName(String(error.meta?.shell ?? "")), 100)}`;
+	return error instanceof Error ? error.message : String(error);
+}
+/**
+* Truncate to at most `maxBytes` UTF-8 bytes without splitting a code point.
+* A character-count `slice` does not bound the WS close reason: `ws` measures
+* `Buffer.byteLength` against its 123-byte cap, and the resulting throw would
+* replace the very error the reason describes.
+*/
+function truncateUtf8Bytes(value, maxBytes) {
+	if (Buffer.byteLength(value) <= maxBytes) return value;
+	let truncated = "";
+	for (const character of value) {
+		if (Buffer.byteLength(truncated + character) > maxBytes) break;
+		truncated += character;
+	}
+	return truncated;
+}
+/**
 * Wire one terminal socket to its pty: replay transcript, pump both ways.
 * Two attach modes share the wire protocol:
 * - `?uuid=...` attaches to an agent-owned terminal (created by the
@@ -4476,6 +5198,7 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 		const cwd = await sessionCwdOf(ctx, sessionId, url.searchParams.get("cwd") ?? void 0);
 		const overrides = shellOverridesOf(getSettings);
 		const handle = ptyManager.open(sessionId, tabId, cwd, 80, 24, overrides.shell, overrides.shellArgs);
+		armPtyResizeGate(handle.pty);
 		if (handle.transcript !== "") ws.send(handle.transcript);
 		const onData = (data) => {
 			if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 4194304) ws.send(data);
@@ -4501,10 +5224,8 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 				return;
 			}
 			if (handle.exited) return;
-			if (control !== null && control.type === "resize" && typeof control.cols === "number" && typeof control.rows === "number") {
-				const dims = clampDims(control.cols, control.rows);
-				handle.pty.resize(dims.cols, dims.rows);
-			} else handle.pty.write(text);
+			if (control !== null && control.type === "resize" && typeof control.cols === "number" && typeof control.rows === "number") tryResizePty(handle.pty, control.cols, control.rows);
+			else handle.pty.write(text);
 		});
 		ws.on("close", () => {
 			dataSub.dispose();
@@ -4512,7 +5233,7 @@ async function attachTerminal(ctx, ptyManager, agentPtyRegistry, ws, req, resolv
 			if (!ptyManager.isParked(handle.key)) ptyManager.scheduleClose(handle.key, resolved.reconnectGraceMs);
 		});
 	} catch (error) {
-		ws.close(1011, error instanceof Error ? error.message : String(error));
+		ws.close(1011, wsCloseReasonOf(error));
 	}
 }
 /**
@@ -4544,10 +5265,8 @@ function pumpAgentTerminal(registry, handle, ws) {
 			registry.close(handle.uuid);
 			return;
 		}
-		if (control !== null && control.type === "resize" && typeof control.cols === "number" && typeof control.rows === "number") {
-			const dims = clampDims(control.cols, control.rows);
-			handle.pty.resize(dims.cols, dims.rows);
-		} else if (control === null) handle.pty.write(text);
+		if (control !== null && control.type === "resize" && typeof control.cols === "number" && typeof control.rows === "number") tryResizePty(handle.pty, control.cols, control.rows);
+		else if (control === null) handle.pty.write(text);
 	});
 	ws.on("close", () => {
 		dataSub.dispose();
@@ -4555,4 +5274,4 @@ function pumpAgentTerminal(registry, handle, ws) {
 	});
 }
 //#endregion
-export { Config, apply, inject, mediaTypeForPath, name };
+export { Config, apply, inject, mediaTypeForPath, name, wsCloseReasonOf };

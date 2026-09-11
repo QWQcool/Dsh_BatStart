@@ -4,7 +4,7 @@
 
 引擎 **不进 git**。每次启动向 **npmjs.org** 查询 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 `latest`，本机落后则自动升级（国内镜像未同步时回退到 npmjs 安装）。别人 clone 后同样直接跟 npm，不必等本仓库先推一版。
 
-当前引擎线是 **0.1.1 预览**（含官方 **Flash Vision**）。仓库里的 `package.json` 只记录你本机刚装上的版本，方便拥有者 git 提交；克隆用户仍自己查 npm。
+当前引擎线是 **0.1.5 预览**（新会话默认模型 **DeepSeek-V41-Flash**，新增原生右侧栏 / 通用文件上传 / 动态系统提示词）。仓库里的 `package.json` 只记录你本机刚装上的版本，方便拥有者 git 提交；克隆用户仍自己查 npm。
 
 > 公式：`Model + Harness = Agent`。DSH 是 AI 智能体运行框架（对标 Claude Code / Codex），「一切皆插件」（模型 / 工具 / 预设 / 循环均可替换）。
 
@@ -29,11 +29,19 @@
 
 ## 模型与识图
 
-- **对话 / 编码**：设置 → Models 里选官方 DeepSeek 模型；只配 `DEEPSEEK_API_KEY` 即可聊。
-- **官方 Flash Vision**（0.1.1+）：模型选择器里的 `DeepSeek-V4-Flash-Vision-Exp`。聊天里**粘贴 / 附件**图片直接进对话，走 DSH 原生多模态。
+- **对话 / 编码**：设置 → Models 里选官方 DeepSeek 模型；只配 `DEEPSEEK_API_KEY` 即可聊。0.1.5 起新会话默认 **`DeepSeek-V41-Flash`**（id `deepseek-flash`）。
+- **原生多模态**：`DeepSeek-V41-Flash` 与 `DeepSeek-V4-Flash-Vision-Exp` 都收图，聊天里**粘贴 / 附件**图片直接进对话，走 DSH 原生多模态。
 - **外部识图插件**（可选）：设置里的 `view_image`，默认智谱 `glm-4.6v-flash`。给本地路径、URL、或纯文本模型看图用。
 
 两条路**同时保留**，不会互相卸载。
+
+## 0.1.5 有什么（相对 0.1.1）
+
+- **默认模型换成 `DeepSeek-V41-Flash`**（`deepseek-flash`，文本 + 图片，支持会话内改系统提示词），新会话直接用它。
+- **原生右侧栏**：多标签 / 分栏 / 全屏，预览 Markdown、代码高亮、HTML、PDF、图片；原 Detail 面板移除。
+- **通用文件上传**：任意类型文件与图片同区混排，支持进度 / 取消，模型可按保存路径读取。
+- 反馈可独立提交（`/feedback`）；顶栏「在应用中打开」；出站请求遵循 `HTTP_PROXY` / `HTTPS_PROXY` 等代理变量。
+- ⚠️ **破坏性变更**（本仓库已逐项改好）：会话格式升到 **V3**（只升不降，旧历史可能打不开）、插件 Agent API 去掉 `ctx.agent`、Web 插件面板 API 改为 `sidebar.panellist` / `main`、`dsh-system-prompt` 的 `persona` 拆成 `personaPrefix` / `personaSuffix`、`dsh-persona` 的 `text` 改名 `prefix`、极简模式默认只给持久 shell。
 
 ## dsh-extra：伴侣插件 / 预设 / 全局提示词
 
@@ -45,15 +53,15 @@
 | `dsh-extra/presets/` | 8 个扩展预设（含 Windows 极简 `minimal-win`、`router-standard` 等） | 引擎 `config/agent-presets/` |
 | `dsh-extra/sync-from-npm.cjs` | 每次启动跟 npm 升引擎 | — |
 | `dsh-extra/deploy-extra.cjs` | 部署伴侣内容 + 打印已挂载插件 | — |
-| **全局提示词** | **oh-we-need**（DeepSeek V4 思维链引导，`we need to ...`）写入 `system-prompt.persona` | 每次会话全局生效 |
+| **全局提示词** | **oh-we-need**（DeepSeek V4 思维链引导，`we need to ...`）写入 `system-prompt.personaPrefix` | 每次会话全局生效 |
 
-**clone 后双击 `.bat` = 完整版**，不用另装 DSH Desktop。伴侣插件已按 **0.1.1 网页客户端**改过（不再引用已删除的 `@deepseek-ai/dsh-client-web-react`），避免白屏 `Failed to load plugins`。
+**clone 后双击 `.bat` = 完整版**，不用另装 DSH Desktop。伴侣插件已按 **0.1.5 网页客户端**适配（`dsh-persona` 用 `prefix`、`dsh-system-prompt` 用 `personaPrefix`、`dsh-prompt-custom` 兼容新旧 persona 节、侧边栏插件跟到 `0.19.0`），避免白屏 `Failed to load plugins`。
 
 ### oh-we-need 全局提示词
 
 来源：[scp3500/oh-we-need](https://github.com/scp3500/oh-we-need)（MIT）。作为部署级 persona 注入：
 
-- 位置：`~/.dsh/profiles/web/cordis.patch.yml` → `system-prompt` 的 `config.persona`
+- 位置：`~/.dsh/profiles/web/cordis.patch.yml` → `system-prompt` 的 `config.personaPrefix`（0.1.1 时代叫 `config.persona`，脚本会自动迁移）
 - 范围：所有会话、所有预设（agent 级 persona 未设时用此默认）
 - 想改/关闭：改该文件，或改 `deploy-extra.cjs` 里的 `OH_WE_NEED_PERSONA` 后重新双击
 
@@ -67,7 +75,7 @@ node "<仓库>\node_modules\@deepseek-ai\dsh\lib\bin.js" web --port 3090
 
 ## 预设
 
-默认 `minimal-win`（Windows 极简：rc.8 起为持久 PowerShell PTY + 编辑器）。Web UI 可切换 `standard` / `code`（界面名 **PTC 模式**）/ `minimal` / `minimal-win` / `router-standard` 等共 12 个（4 个官方 + 8 个来自 `dsh-extra/presets`）。
+默认 `minimal-win`（Windows 极简：持久 PowerShell PTY + 编辑器）。Web UI 可切换 `standard`（标准模式）/ `ptc`（**PTC 模式**）/ `minimal`（极简模式）/ `cordis`（创造模式）/ `minimal-win` / `router-standard` 等共 12 个（4 个官方 + 8 个来自 `dsh-extra/presets`）。
 
 ## 自带：跨会话记忆
 
@@ -85,8 +93,9 @@ node "<仓库>\node_modules\@deepseek-ai\dsh\lib\bin.js" web --port 3090
 - 浏览器没自动开：手动访问 `http://127.0.0.1:3090`。
 - 报「未找到 node」：安装 Node.js 并确保在 `PATH`。
 - 报「引擎安装失败」：检查网络。跟的是 npmjs 上的 `@deepseek-ai/dsh` / `dsh-trivium` `latest`。升级引擎会清掉 `node_modules` 再装（原地 upgrade 会卡住）。
-- **白屏 Failed to load plugins**：先 **Ctrl+F5** 强刷，避免缓存旧 `client.js`。本仓库伴侣插件已适配 0.1.1；侧边栏若仍等上游更新，不挡主界面。
-- **升级预览版**：rc.8 起官方 SQLite 会话格式不兼容旧版，升引擎后旧历史可能打不开，当新任务即可。
+- **白屏 Failed to load plugins**：先 **Ctrl+F5** 强刷，避免缓存旧 `client.js`。本仓库伴侣插件已适配 0.1.5；侧边栏插件（`dsh-better-sidebar`）需要宿主提供 `dsh-client-ui-slots` / `dsh-client-ui-primitives`，0.1.5 引擎不再随包带、离线副本也补不了这个 peer——要用请走官方 `dsh plugin --profile web add dsh-better-sidebar@latest`（会顺带装 peer），不挡主界面。
+- **升级预览版**：rc.8 起官方 SQLite 会话格式不兼容旧版；**0.1.5 起会话格式升到 V3（只升不降）**，升引擎后旧历史可能打不开，当新任务即可。
+- **升级后全局提示词失效 / 预设报错**：0.1.5 把 `system-prompt` 的 `persona` 拆成 `personaPrefix` / `personaSuffix`，预设的 `dsh-persona` 也从 `text` 改名 `prefix`。本仓库已改好；若你手改过 `~/.dsh/profiles/web/cordis.patch.yml`，重新双击一次 `.bat` 会自动把旧 `persona` 就地迁成 `personaPrefix`。
 - 全局提示词没生效：确认 `.bat` 跑过 `deploy-extra.cjs`；检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否含 `system-prompt`。
 - `Cannot find package '@deepseek-ai/dsh-llm'`（来自 `Desktop/dsh-trivium`）：本地源码不要自己 `npm install` peer。再跑一次启动脚本，会把宿主里的 `dsh-llm` / `dsh-tools` junction 过去。
 

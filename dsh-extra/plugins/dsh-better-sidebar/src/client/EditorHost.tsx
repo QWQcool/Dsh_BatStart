@@ -27,8 +27,9 @@ import { createElement } from 'react'
 import clsx from 'clsx'
 import { IconCheckOutline16, IconFolderOpen16, IconRefreshOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context } from '../context-types.ts'
-import { api, mediaUrl, type SessionScope } from './api.ts'
+import { api, isOutsideWorkspaceMessage, mediaUrl, type SessionScope } from './api.ts'
 import { BinaryDownload } from './binary-download.tsx'
+import { FenceErrorNotice } from './FenceErrorNotice.tsx'
 import { planFirstMatch, planFsReadOutcome, type EditorLoadAction } from './editor-load.ts'
 import { baseName } from './FileTree.tsx'
 import { createFrameBatcher } from './frame-batcher.ts'
@@ -39,8 +40,9 @@ import { TreePanel } from './TreePanel.tsx'
 import { t } from './locales.ts'
 import { relativeTo } from './paths.ts'
 import { resolveSidebarPath } from './produced-files.ts'
+import { closePathTabs, retargetPathTabs } from './tree-mutations.ts'
 import type { EditorToolbarControls, EditorToolbarState, FileViewerDescriptor } from './service.ts'
-import { firstLeaf, insertLeafAt, leafWithTab, mintTabId, treeOf, type SidebarStore, type SidebarTab } from './state.ts'
+import { firstLeaf, insertLeafAt, leafWithTab, mintTabId, type SidebarStore, type SidebarTab } from './state.ts'
 import css from './sidebar.module.css'
 
 type EditorLoad =
@@ -99,7 +101,7 @@ export function EditorHost(props: {
   expanded: string[]
   revealed: string[]
   onToggleDir: (path: string) => void
-  onReferenceFile: (path: string) => void
+  onReferenceFile: (path: string, isDir: boolean) => void
 }) {
   const { ctx, store, scope, tab, expanded, revealed, onToggleDir, onReferenceFile } = props
   const path = tab.path ?? ''
@@ -176,8 +178,7 @@ export function EditorHost(props: {
    */
   const openFileSide = (absolute: string): void => {
     store.reduce((state) => {
-      const key = treeOf(state, tab.id)
-      const pane = leafWithTab(state[key], tab.id) ?? firstLeaf(state[key])
+      const pane = leafWithTab(state.bottomSplits, tab.id) ?? firstLeaf(state.bottomSplits)
       const fresh: SidebarTab = {
         id: mintTabId(),
         type: 'editor',
@@ -185,16 +186,17 @@ export function EditorHost(props: {
         path: absolute,
         meta: { treeOpen: false },
       }
-      const { node, leafId } = insertLeafAt(state[key], pane.id, 'row', fresh, false)
-      return { ...state, [key]: node, activePane: leafId }
+      const { node, leafId } = insertLeafAt(state.bottomSplits, pane.id, 'row', fresh, false)
+      return { ...state, bottomSplits: node, activePane: leafId }
     })
   }
 
   /** The context menu's "open with" action: reveal the path in the OS file
-   *  manager, or hand the target's URL (a local `file` URL, or the SSH-remote
-   *  form for VSCode-family editors in remote mode) to the host's external
-   *  opener. Failures are logged only — a missing handler is the OS's
-   *  dialog, not a sidebar error. */
+   *  manager, or hand the target's URL to its opener — local `file` URLs go
+   *  to the host's external opener, while the SSH-remote form for
+   *  VSCode-family editors launches on the browser/client machine (see
+   *  api.openExternal). Failures are logged only — a missing handler is the
+   *  OS's/browser's dialog, not a sidebar error. */
   const openWith = (targetId: string, absolute: string): void => {
     const target = openWithTargets.find(item => item.id === targetId)
     if (target === undefined) return
@@ -221,6 +223,16 @@ export function EditorHost(props: {
         : [...config.pinned, targetId]
       return { ...blob, openWith: { ...config, pinned } }
     })
+  }
+
+  // Tree mutations reconcile the OPEN tabs (both split trees, the bottom
+  // panel, free windows): a rename retargets its tab to the new path; a
+  // delete closes tabs at or under the removed path. See tree-mutations.ts.
+  const onPathRenamed = (oldPath: string, newPath: string): void => {
+    retargetPathTabs(ctx, store, oldPath, newPath)
+  }
+  const onPathDeleted = (path: string): void => {
+    closePathTabs(ctx, store, path)
   }
 
   // The viewer's toolbar, hoisted into THIS header: the text editor reports
@@ -336,6 +348,9 @@ export function EditorHost(props: {
     }
     apply(planFirstMatch(ctx.get('betterSidebar')?.matchFileViewer(path), mediaUrlOf))
     return () => { cancelled = true; controller.abort() }
+    // The deps are deliberately granular: the scope object's identity churns,
+    // only its sessionId / cwd fields gate the (re)fetch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope.sessionId, scope.cwd, path, ctx, showEmpty, isDir, reloadSeq])
 
   // Save-then-refresh in preview mode (issue #167 part C): the edge into
@@ -369,6 +384,7 @@ export function EditorHost(props: {
       <div className={css.editor}>
         <TreePanel
           full
+          store={store}
           sessionId={scope.sessionId}
           cwd={folderRoot ?? scope.cwd}
           expanded={expanded}
@@ -383,6 +399,8 @@ export function EditorHost(props: {
           onOpenWith={openWith}
           onToggleOpenWithPin={toggleOpenWithPin}
           onReferenceFile={onReferenceFile}
+          onPathRenamed={onPathRenamed}
+          onPathDeleted={onPathDeleted}
         />
       </div>
     )
@@ -460,7 +478,9 @@ export function EditorHost(props: {
         <div className={css.editorMain}>
           {showEmpty && <div className={css.editorPlaceholder}>{t('editorEmptyHint')}</div>}
           {!showEmpty && load.status === 'loading' && <div className={css.editorPlaceholder}>{t('loading')}</div>}
-          {!showEmpty && load.status === 'error' && <div className={css.editorError}>{load.message}</div>}
+          {!showEmpty && load.status === 'error' && (isOutsideWorkspaceMessage(load.message)
+            ? <FenceErrorNotice store={store} onDisabled={() => { setReloadSeq(sequence => sequence + 1) }} />
+            : <div className={css.editorError}>{load.message}</div>)}
           {!showEmpty && load.status === 'binary' && <BinaryDownload scope={scope} path={path} />}
           {!showEmpty && load.status === 'ready' && createElement(load.viewer.component, {
             ctx, store, scope, path, title,
@@ -488,6 +508,7 @@ export function EditorHost(props: {
               onPointerCancel={onResizeEnd}
             />
             <TreePanel
+              store={store}
               sessionId={scope.sessionId}
               cwd={scope.cwd}
               expanded={expanded}
@@ -502,6 +523,8 @@ export function EditorHost(props: {
               onOpenWith={openWith}
               onToggleOpenWithPin={toggleOpenWithPin}
               onReferenceFile={onReferenceFile}
+              onPathRenamed={onPathRenamed}
+              onPathDeleted={onPathDeleted}
             />
           </div>
         )}

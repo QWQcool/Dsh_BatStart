@@ -20,20 +20,24 @@
  * (VSCode semantics — a drop on a file row targets its parent directory),
  * and `busy` gates new drags while one upload is in flight.
  */
-import { useCallback, useEffect, useRef, useState, type DragEvent, type MouseEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import clsx from 'clsx'
 import {
-  IconChevronRightOutline14, IconCodeOutline16, IconCopyOutline16, IconDownloadOutline16,
-  IconLinkOutline16, Menu, type MenuEntry, type MenuItem, writeClipboard,
+  Button, IconChevronRightOutline14, IconCloseFill14, IconCodeOutline16, IconCopyOutline16, IconDownloadOutline16,
+  IconEditOutline16, IconLinkOutline16, IconTrashOutline16, Menu, Modal, type MenuEntry, type MenuItem, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { SiCursor, SiZedindustries } from 'react-icons/si'
 import { VscFile, VscFolder, VscFolderOpened, VscLinkExternal, VscPin, VscPinned } from 'react-icons/vsc'
-import { api, downloadUrl, type FsEntry } from './api.ts'
+import { api, downloadUrl, isOutsideWorkspaceMessage, type FsEntry } from './api.ts'
+import { FenceErrorNotice } from './FenceErrorNotice.tsx'
 import { IconUploadOutline16, IconVscode16 } from './icons.tsx'
+import { isImeComposition } from './ime-guard.ts'
+import { useSubmenuFlip } from './menu-flip.ts'
 import type { OpenWithTarget } from './open-with.ts'
 import { relativeTo } from './paths.ts'
 import { t } from './locales.ts'
+import type { SidebarStore } from './state.ts'
 import { uploadItemsFromDrop, uploadItemsFromFiles, type UploadItem } from './upload.ts'
 import css from './sidebar.module.css'
 
@@ -105,6 +109,8 @@ const ChatDropIllustration = () => (
 export function FileTree(props: {
   sessionId: string
   cwd: string | undefined
+  /** The sidebar store: the fence-refusal notice writes the `workspaceFence` pref through it. */
+  store: SidebarStore
   expanded: string[]
   /** Files highlighted by a "Show in folder" reveal (absolute paths). */
   revealed: string[]
@@ -127,8 +133,12 @@ export function FileTree(props: {
   onOpenWith?: (targetId: string, path: string) => void
   /** Toggle one target's pinned state (the submenu row's pushpin). */
   onToggleOpenWithPin?: (targetId: string) => void
-  /** Insert `@<relative path>` into the composer draft. */
-  onReferenceFile: (path: string) => void
+  /** Insert `@<relative path>` into the composer draft (file vs directory). */
+  onReferenceFile: (path: string, isDir: boolean) => void
+  /** A rename landed (old row path → new path): the caller retargets open tabs. */
+  onPathRenamed?: (oldPath: string, newPath: string) => void
+  /** A delete landed: the caller closes tabs at or under the removed path. */
+  onPathDeleted?: (path: string, isDir: boolean) => void
   /** Bump to wipe the level cache and reload the visible set. */
   refreshTick: number
   /** Upload into `dir` (absolute, inside the workspace); runs in the caller. */
@@ -136,13 +146,22 @@ export function FileTree(props: {
   /** True while an upload is in flight (drops are ignored). */
   busy: boolean
 }) {
-  const { sessionId, cwd, expanded, revealed, onToggle, onOpenFile, onOpenFileNewTab, onOpenFileSide, openWithTargets, openWithPinned, openWithSsh, onOpenWith, onToggleOpenWithPin, onReferenceFile, refreshTick, onUploadRequest, busy } = props
+  const { sessionId, cwd, store, expanded, revealed, onToggle, onOpenFile, onOpenFileNewTab, onOpenFileSide, openWithTargets, openWithPinned, openWithSsh, onOpenWith, onToggleOpenWithPin, onReferenceFile, onPathRenamed, onPathDeleted, refreshTick, onUploadRequest, busy } = props
   const [data, setData] = useState<Record<string, LevelData>>({})
   const dataRef = useRef(data)
   /** The row whose path was just copied ("copied" label replaces its button). */
   const [copiedPath, setCopiedPath] = useState<string | null>(null)
   /** Open context menu: the row path (and whether it is a directory) plus the cursor position. */
   const [rowMenu, setRowMenu] = useState<{ path: string; isDir: boolean; x: number; y: number } | null>(null)
+  // The row menu's "open with" submenu is the one submenu that can tower past
+  // the viewport; publish its flip geometry for layout.css while it is open.
+  useSubmenuFlip(rowMenu)
+  /** The row being renamed inline: its path plus the edit buffer. */
+  const [renaming, setRenaming] = useState<{ path: string; value: string } | null>(null)
+  /** The delete awaiting the confirmation modal's yes. */
+  const [confirmDelete, setConfirmDelete] = useState<{ path: string; isDir: boolean; name: string } | null>(null)
+  /** The last mutation failure (dismissable strip above the tree). */
+  const [actionError, setActionError] = useState<string | null>(null)
   /** Whether a file drag hovers the tree (drives the portaled drop zone). */
   const [dropOver, setDropOver] = useState(false)
   /** The directory a drag is hovering right now (null = body, drop to root). */
@@ -257,6 +276,70 @@ export function FileTree(props: {
     })
   }, [sessionId, cwd, storeLevel])
 
+  /** Drop one level from the cache and reload it (the fence notice's retry). */
+  const retryDir = useCallback((dir: string) => {
+    delete dataRef.current[dir]
+    setData({ ...dataRef.current })
+    loadDir(dir)
+  }, [loadDir])
+
+  /**
+   * Settle the tree after one rename/delete landed at `prefix`: drop every
+   * cached level at or under the old path, collapse the now-stale expanded
+   * directories below it, and reload the immediate parent so the new shape
+   * shows without a full refresh tick.
+   */
+  const pruneTree = (prefix: string): void => {
+    const parent = parentOf(prefix)
+    const under = (key: string): boolean => key === prefix || key.startsWith(`${prefix}/`) || key.startsWith(`${prefix}\\`)
+    for (const key of Object.keys(dataRef.current)) {
+      if (under(key)) delete dataRef.current[key]
+    }
+    if (parent !== prefix) delete dataRef.current[parent]
+    setData({ ...dataRef.current })
+    for (const dir of expanded) {
+      if (under(dir)) onToggle(dir)
+    }
+    if (parent !== prefix) retryDir(parent)
+  }
+
+  /** Client-side twin of the server's name rule (the server re-validates). */
+  const validRename = (name: string): boolean =>
+    name !== '' && name !== '.' && name !== '..' && !name.includes('/') && !name.includes('\\')
+
+  /** Commit the inline rename: trim, no-op guard, then fs.rename + settle. */
+  const commitRename = (path: string, raw: string): void => {
+    setRenaming(null)
+    const name = raw.trim()
+    if (cwd === undefined || name === baseName(path) || !validRename(name)) {
+      if (name !== baseName(path) && !validRename(name)) setActionError(t('renameInvalid'))
+      return
+    }
+    api.fsRename({ sessionId, cwd }, path, name)
+      .then((result) => {
+        setActionError(null)
+        pruneTree(path)
+        onPathRenamed?.(path, result.path)
+      })
+      .catch((error: unknown) => {
+        setActionError(error instanceof Error ? error.message : String(error))
+      })
+  }
+
+  /** Run the confirmed delete: fs.remove + settle + close affected tabs. */
+  const performDelete = (target: { path: string; isDir: boolean }): void => {
+    if (cwd === undefined) return
+    api.fsRemove({ sessionId, cwd }, target.path)
+      .then(() => {
+        setActionError(null)
+        pruneTree(target.path)
+        onPathDeleted?.(target.path, target.isDir)
+      })
+      .catch((error: unknown) => {
+        setActionError(error instanceof Error ? error.message : String(error))
+      })
+  }
+
   // The caller's refresh tick wipes the cache (declared BEFORE the load
   // effect so the reload below sees the empty cache).
   const lastTick = useRef(refreshTick)
@@ -280,10 +363,21 @@ export function FileTree(props: {
   // (revealPaths), but the row may not be scrolled into sight — a reveal on
   // a long tree should surface the highlighted file. Re-runs when the tree
   // data or reveal set changes (the row appears after its level loads).
+  // Scrolls ONLY this tree's body: scrollIntoView would scroll every
+  // scrollable ancestor, and the clipping panel host
+  // ([data-dsh-panel-host]) is still programmatically scrollable — a deep
+  // reveal shifted the whole panel, tab bar included, out of the viewport.
   useEffect(() => {
     if (revealed.length === 0) return
-    const row = bodyRef.current?.querySelector('[data-dsh-revealed]')
-    row?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    const body = bodyRef.current
+    if (body === null) return
+    const row = body.querySelector<HTMLElement>('[data-dsh-revealed]')
+    if (row === null) return
+    const bodyTop = body.getBoundingClientRect().top
+    const rowRect = row.getBoundingClientRect()
+    const target = body.scrollTop + (rowRect.top + rowRect.height / 2) - (bodyTop + body.clientHeight / 2)
+    const max = Math.max(body.scrollHeight - body.clientHeight, 0)
+    body.scrollTo({ top: Math.min(Math.max(target, 0), max), behavior: 'smooth' })
   }, [revealed, data])
 
   /** Copy `text`; on success flip the row's copied label for a moment. */
@@ -310,7 +404,7 @@ export function FileTree(props: {
         title={t('referenceFile')}
         onClick={(event) => {
           event.stopPropagation()
-          onReferenceFile(entry.path)
+          onReferenceFile(entry.path, entry.isDir)
         }}
       >
         {t('referenceFile')}
@@ -351,13 +445,14 @@ export function FileTree(props: {
     if (openWithTargets === undefined || onOpenWith === undefined || openWithTargets.length === 0) return []
     const pinnedIds = openWithPinned ?? []
     /** Brand marks for the built-ins (monochrome silhouettes, currentColor);
-     *  reveal gets the folder glyph, custom editors a generic code mark. */
+     *  reveal gets the folder glyph, custom editors a generic code mark.
+     *  The compact menu's icon slot is 14px, so every mark renders at 14. */
     const itemIcon = (target: OpenWithTarget): ReactNode => {
-      if (target.kind === 'reveal') return <VscFolderOpened size={16} />
-      if (target.id === 'vscode') return <IconVscode16 size={16} />
-      if (target.id === 'cursor') return <SiCursor size={16} />
-      if (target.id === 'zed') return <SiZedindustries size={16} />
-      return <IconCodeOutline16 size={16} />
+      if (target.kind === 'reveal') return <VscFolderOpened size={14} />
+      if (target.id === 'vscode') return <IconVscode16 size={14} />
+      if (target.id === 'cursor') return <SiCursor size={14} />
+      if (target.id === 'zed') return <SiZedindustries size={14} />
+      return <IconCodeOutline16 size={14} />
     }
     const pinned = openWithTargets
       .filter(target => pinnedIds.includes(target.id))
@@ -390,7 +485,7 @@ export function FileTree(props: {
                 onToggleOpenWithPin?.(target.id)
               }}
             >
-              {pinnedNow ? <VscPinned size={14} /> : <VscPin size={14} />}
+              {pinnedNow ? <VscPinned size={12} /> : <VscPin size={12} />}
             </span>
           </span>
         ),
@@ -411,7 +506,7 @@ export function FileTree(props: {
             <IconChevronRightOutline14 size={14} className={css.openWithChevron} aria-hidden />
           </span>
         ),
-        icon: <VscLinkExternal size={16} />,
+        icon: <VscLinkExternal size={14} />,
         submenu,
       },
     ]
@@ -419,12 +514,80 @@ export function FileTree(props: {
 
   const root = cwd
 
+  // Membership is tested per rendered row (deep trees run this thousands of
+  // times per render): includes() made every row O(expanded), the whole tree
+  // O(rows × expanded). One Set per render keeps it O(1) per row.
+  const expandedSet = useMemo(() => new Set(expanded), [expanded])
+  const revealedSet = useMemo(() => new Set(revealed), [revealed])
+
+  /**
+   * Focus + select the rename editor once, on mount. The callback identity
+   * must stay STABLE (useCallback []): an inline arrow re-runs on every
+   * render (detach null → attach el), and focus()/select() mid-keystroke
+   * would reselect the whole buffer while typing. A plain <input>, not the
+   * primitives Input — that one forwards no ref, and focus+select is the
+   * entire point here.
+   */
+  const renameInputRef = useCallback((el: HTMLInputElement | null): void => {
+    if (el !== null) {
+      el.focus()
+      el.select()
+    }
+  }, [])
+
+  /** The inline rename editor replacing one row (dirs and files alike):
+   *  same indent/icon/height for a seamless swap, Enter/blur commits,
+   *  Escape cancels, IME composition keys never reach the handlers (the
+   *  shared isImeComposition guard). */
+  const renderRenameRow = (entry: FsEntry, depth: number): ReactNode => (
+    <div
+      key={entry.path}
+      className={clsx(css.explorerRow, css.explorerRenaming)}
+      style={{ paddingLeft: depth * 22 + 6 }}
+    >
+      {entry.isDir
+        ? (expandedSet.has(entry.path) ? <VscFolderOpened size={14} /> : <VscFolder size={14} />)
+        : <VscFile size={14} />}
+      <input
+        ref={renameInputRef}
+        className={css.explorerRenameInput}
+        value={renaming?.value ?? ''}
+        aria-label={t('rename')}
+        spellCheck={false}
+        onChange={(event) => {
+          setRenaming(prev => prev === null ? prev : { ...prev, value: event.target.value })
+        }}
+        onKeyDown={(event) => {
+          if (isImeComposition(event)) return
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            commitRename(entry.path, renaming?.value ?? '')
+          } else if (event.key === 'Escape') {
+            event.preventDefault()
+            setRenaming(null)
+          }
+        }}
+        onBlur={() => { commitRename(entry.path, renaming?.value ?? '') }}
+      />
+    </div>
+  )
+
   const renderLevel = (dir: string, depth: number): ReactNode => {
     const level = data[dir]
     if (level === undefined) {
       return <div className={css.explorerRow} style={{ paddingLeft: depth * 22 + 6 }}>{t('loading')}</div>
     }
     if (level.error !== undefined) {
+      // The fence refusal becomes the friendly notice (reason + one-click
+      // global off + immediate retry of this directory), never the raw
+      // `path "..." is outside workspace` wire text.
+      if (isOutsideWorkspaceMessage(level.error)) {
+        return (
+          <div style={{ paddingLeft: depth * 22 + 6 }}>
+            <FenceErrorNotice store={store} onDisabled={() => { retryDir(dir) }} />
+          </div>
+        )
+      }
       return (
         <div className={clsx(css.explorerRow, css.explorerError)} style={{ paddingLeft: depth * 22 + 6 }}>
           {level.error}
@@ -433,8 +596,12 @@ export function FileTree(props: {
     }
     const entries = level.entries ?? []
     return entries.map(entry => {
+      // The row being renamed renders as its editor (no button semantics:
+      // an editor is not a click target — and a nested interactive inside
+      // role="button" would be invalid anyway).
+      if (renaming?.path === entry.path) return renderRenameRow(entry, depth)
       if (entry.isDir) {
-        const isOpen = expanded.includes(entry.path)
+        const isOpen = expandedSet.has(entry.path)
         return (
           <div key={entry.path}>
             <div
@@ -443,9 +610,9 @@ export function FileTree(props: {
               className={clsx(
                 css.explorerRow, css.explorerDir, entry.hidden && css.explorerHidden,
                 dropTarget === entry.path && css.explorerRowDropTarget,
-                revealed.includes(entry.path) && css.explorerRowRevealed,
+                revealedSet.has(entry.path) && css.explorerRowRevealed,
               )}
-              data-dsh-revealed={revealed.includes(entry.path) ? 'true' : undefined}
+              data-dsh-revealed={revealedSet.has(entry.path) ? 'true' : undefined}
               style={{ paddingLeft: depth * 22 + 6 }}
               onClick={() => { onToggle(entry.path) }}
               onKeyDown={(event) => {
@@ -475,9 +642,9 @@ export function FileTree(props: {
           className={clsx(
             css.explorerRow, entry.hidden && css.explorerHidden, entry.broken && css.explorerBroken,
             dropTarget === parentOf(entry.path) && css.explorerRowDropTarget,
-            revealed.includes(entry.path) && css.explorerRowRevealed,
+            revealedSet.has(entry.path) && css.explorerRowRevealed,
           )}
-          data-dsh-revealed={revealed.includes(entry.path) ? 'true' : undefined}
+          data-dsh-revealed={revealedSet.has(entry.path) ? 'true' : undefined}
           style={{ paddingLeft: depth * 22 + 6 }}
           title={entry.broken ? `${entry.path} — ${t('brokenSymlink')}` : entry.path}
           onClick={() => { onOpenFile(entry.path) }}
@@ -513,6 +680,22 @@ export function FileTree(props: {
         <div className={css.explorerEmpty}>{t('noSession')}</div>
       ) : (
         <>
+          {/* The last mutation failure (rename/delete): dismissable, raw
+              server text — the same show-the-truth policy the fence notice
+              uses. Any later action or a fresh attempt clears it. */}
+          {actionError !== null && (
+            <div className={css.explorerActionError} role="alert">
+              <span className={css.explorerActionErrorText}>{actionError}</span>
+              <button
+                type="button"
+                className={css.explorerActionErrorClose}
+                aria-label={t('dismiss')}
+                onClick={() => { setActionError(null) }}
+              >
+                <IconCloseFill14 />
+              </button>
+            </div>
+          )}
           <div
             className={clsx(css.explorerRow, dropTarget === root && css.explorerRowDropTarget)}
             style={{ paddingLeft: 6 }}
@@ -532,7 +715,7 @@ export function FileTree(props: {
                   title={t('referenceFile')}
                   onClick={(event) => {
                     event.stopPropagation()
-                    onReferenceFile(root)
+                    onReferenceFile(root, true)
                   }}
                 >
                   {t('referenceFile')}
@@ -612,22 +795,31 @@ export function FileTree(props: {
         items={[
           // The open escapes head the FILE menu (dirs only get copy).
           ...(rowMenu?.isDir === false && onOpenFileNewTab !== undefined
-            ? [{ id: 'open-new-tab', label: t('openFileNewTab'), icon: <IconCodeOutline16 size={16} /> }]
+            ? [{ id: 'open-new-tab', label: t('openFileNewTab'), icon: <IconCodeOutline16 size={14} /> }]
             : []),
           ...(rowMenu?.isDir === false && onOpenFileSide !== undefined
-            ? [{ id: 'open-side', label: t('openFileSide'), icon: <VscFolderOpened size={16} /> }]
+            ? [{ id: 'open-side', label: t('openFileSide'), icon: <VscFolderOpened size={14} /> }]
             : []),
           ...openWithEntries(),
           // Download applies to files only (the host route refuses directories).
           ...(rowMenu?.isDir === false
-            ? [{ id: 'download', label: t('download'), icon: <IconDownloadOutline16 size={16} /> }]
+            ? [{ id: 'download', label: t('download'), icon: <IconDownloadOutline16 size={14} /> }]
             : []),
           // Upload into a directory (incl. the workspace root row).
           ...(rowMenu?.isDir === true
-            ? [{ id: 'upload-here', label: t('uploadHere'), icon: <IconUploadOutline16 size={16} /> }]
+            ? [{ id: 'upload-here', label: t('uploadHere'), icon: <IconUploadOutline16 size={14} /> }]
             : []),
-          { id: 'relative', label: t('copyRelative'), icon: <IconCopyOutline16 size={16} /> },
-          { id: 'absolute', label: t('copyAbsolute'), icon: <IconCopyOutline16 size={16} /> },
+          { id: 'relative', label: t('copyRelative'), icon: <IconCopyOutline16 size={14} /> },
+          { id: 'absolute', label: t('copyAbsolute'), icon: <IconCopyOutline16 size={14} /> },
+          // Explorer mutations close the menu; the workspace ROOT row is the
+          // session itself — never renamable or deletable (server double-guards).
+          ...(rowMenu !== null && rowMenu.path !== cwd
+            ? [
+                { id: 'mutate-sep', type: 'separator' } as MenuEntry,
+                { id: 'rename', label: t('rename'), icon: <IconEditOutline16 size={14} /> },
+                { id: 'delete', label: t('delete'), icon: <IconTrashOutline16 size={14} />, danger: true },
+              ]
+            : []),
         ]}
         onSelect={(id) => {
           const target = rowMenu
@@ -654,16 +846,55 @@ export function FileTree(props: {
             fileInputRef.current?.click()
             return
           }
+          if (id === 'rename') {
+            setRenaming({ path: target.path, value: baseName(target.path) })
+            return
+          }
+          if (id === 'delete') {
+            setConfirmDelete({ path: target.path, isDir: target.isDir, name: baseName(target.path) })
+            return
+          }
           copyPath(
             id === 'relative' ? relativeTo(cwd ?? '', target.path) : target.path,
             target.path,
           )
         }}
         portal
+        compact
         align="start"
         getAnchorRect={() => (rowMenu === null ? null : new DOMRect(rowMenu.x, rowMenu.y, 0, 0))}
         anchor={<span />}
       />
+
+      {/* The delete confirmation: destructive and permanent (no host trash),
+          so it always lands here first — the same Cancel/Confirm shape the
+          git lens uses for discard/revert/cherry-pick. */}
+      <Modal
+        open={confirmDelete !== null}
+        onClose={() => { setConfirmDelete(null) }}
+        title={confirmDelete === null ? '' : t('deleteTitle', { name: confirmDelete.name })}
+        closeLabel={t('cancel')}
+        footer={(
+          <>
+            <Button variant="outline" onClick={() => { setConfirmDelete(null) }}>{t('cancel')}</Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                const pending = confirmDelete
+                if (pending === null) return
+                setConfirmDelete(null)
+                performDelete(pending)
+              }}
+            >
+              {t('delete')}
+            </Button>
+          </>
+        )}
+      >
+        <p className={css.explorerConfirmDesc}>
+          {confirmDelete === null ? '' : t(confirmDelete.isDir ? 'deleteDescDir' : 'deleteDescFile')}
+        </p>
+      </Modal>
     </div>
   )
 }

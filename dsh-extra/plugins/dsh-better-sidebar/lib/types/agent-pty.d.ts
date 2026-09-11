@@ -16,6 +16,20 @@ export declare function clampDims(cols: number, rows: number): {
     rows: number;
 };
 /**
+ * Arm the Windows pre-ready resize gate for one freshly spawned pty.
+ * No-op on POSIX and for injected ptys without `onData`.
+ */
+export declare function armPtyResizeGate(pty: IPty): void;
+/**
+ * Best-effort resize for WebSocket-driven terminal views. Layout animation
+ * can briefly produce unusable dimensions, and node-pty can reject a resize
+ * after the socket setup's outer try/catch has returned. Ignore that one
+ * frame so the host stays alive and a later valid measurement can retry.
+ * Returns whether node-pty accepted the resize (or parked it for replay on
+ * the first output — the Windows pre-ready window).
+ */
+export declare function tryResizePty(pty: Pick<IPty, 'resize'>, cols: number, rows: number): boolean;
+/**
  * Serializable snapshot of one agent terminal — the shape the model sees
  * through `terminal_list` and the sidebar sees through the push endpoint.
  * Carries no pty reference and no transcript (those are reached through
@@ -75,12 +89,17 @@ export interface AgentTerminalReadResult {
 export type AgentTerminalWaitResult = {
     /** The needle was found in the transcript. */
     kind: 'found';
-    /** The matched substring. */
+    /** The pattern that was awaited. */
     needle: string;
     /** 0-based line index (in the retained transcript) where the needle first appeared. */
     line: number;
     /** 0-based column index within that line where the match starts. */
     column: number;
+    /**
+     * The text that actually matched — for multi-outcome patterns
+     * ( e.g. `(BUILD_OK|BUILD_FAIL)` ) this tells which alternative matched.
+     */
+    match: string;
     /** Elapsed wall-clock milliseconds from the wait start to the match. */
     elapsedMs: number;
 } | {
@@ -181,7 +200,12 @@ export declare class AgentPtyRegistry {
      * make event-driven wakeups unreliable. A 50ms poll is fast enough for
      * interactive use and simple enough to be obviously correct.
      * @param uuid - terminal to watch.
-     * @param needle - substring to search for (case-sensitive, verbatim).
+     * @param needle - JavaScript regular expression to search for
+     *   (case-sensitive); a pattern that fails to compile falls back to
+     *   verbatim substring matching. May cover several outcomes at once
+     *   ( e.g. `(BUILD_OK|BUILD_FAIL)` for build success vs failure ) — the
+     *   returned `match` reports the text that actually matched, so callers
+     *   can tell which outcome hit.
      * @param timeoutMs - max wait; default 10000 (10s). Clamped to ≥100ms.
      * @param signal - caller-owned cancellation; aborts the wait re-throwing.
      * @returns one of `found` / `timeout` / `exited`.

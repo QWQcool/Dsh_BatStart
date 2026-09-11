@@ -3,7 +3,11 @@ import './layout.css';
 /** Services required before mounting (provided by the client runtime; the
  *  locale service backs the sidebar's copy — see locales.ts). `modules`
  *  (rc.8+) is the client module system the chunk loader resolves its
- *  externals through — Cordis guards service access without inject. */
+ *  externals through; `connection` (0.1.2-alpha.2+) is the Remote transport's
+ *  recovery lifecycle the side chat's disconnect banner reads — Cordis guards
+ *  service access without inject. The `remote.session` namespace is NOT here:
+ *  it mounts asynchronously, so the open-path interception reaches it through
+ *  `ctx.inject` (see intercept.tsx). */
 export declare const inject: string[];
 /**
  * Error boundary over the sidebar tree (root scope): a render error in the

@@ -9,5 +9,5 @@ export declare function EditorHost(props: {
     expanded: string[];
     revealed: string[];
     onToggleDir: (path: string) => void;
-    onReferenceFile: (path: string) => void;
+    onReferenceFile: (path: string, isDir: boolean) => void;
 }): import("react").JSX.Element;

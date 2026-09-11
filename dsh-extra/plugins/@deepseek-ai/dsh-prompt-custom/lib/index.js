@@ -3,9 +3,10 @@
 // 并对每个新建 agent 向其作用域注入提示词节，覆盖/追加官方内核的默认 persona。
 //
 // 注入方式：
-//   - mode = "replace"：注册与预设 persona 同名的 deployment:persona（order 0），
-//     在 agent 作用域遮蔽（shadow）预设 persona，实现整体替换。
-//   - mode = "append"：注册新节 dsh:custom-prompt（order 1），紧随 persona 之后追加。
+//   - mode = "replace"：注册与预设 persona 同名的 deployment:persona-prefix
+//     （0.1.5 前为 deployment:persona），在 agent 作用域遮蔽（shadow）预设
+//     persona，实现整体替换。
+//   - mode = "append"：注册新节 dsh:custom-prompt，紧随 persona 之后追加。
 //
 // 不修改任何官方包，仅通过官方 systemPrompt.section() 与 dsh-settings 能力注入。
 // 设置保存后「新创建的会话/agent」立即生效；运行中会话保持原提示词（与官方 preset 语义一致）。
@@ -15,7 +16,24 @@
 
 import z from "@deepseek-ai/schemastery";
 import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
-import { PERSONA_SECTION, PERSONA_ORDER, renderPrompt } from "@deepseek-ai/dsh-system-prompt";
+import * as systemPromptPkg from "@deepseek-ai/dsh-system-prompt";
+
+// 0.1.5 起官方把单一 persona 节拆成 deployment:persona-prefix / -suffix，
+// 旧的 PERSONA_SECTION / PERSONA_ORDER 命名导出已移除。这里做双版本兼容：
+// 新版取 persona-prefix 节与注册表顺序，旧版回退到 deployment:persona / 0。
+const PERSONA_SECTION = systemPromptPkg.PERSONA_PREFIX_SECTION || systemPromptPkg.PERSONA_SECTION || "deployment:persona";
+const PERSONA_ORDER = typeof systemPromptPkg.PERSONA_ORDER === "number" ? systemPromptPkg.PERSONA_ORDER : 0;
+const { renderPrompt } = systemPromptPkg;
+
+// 新版由注册表暴露具名顺序；旧版没有该方法时回退常量。
+function personaOrder(ctx) {
+	try {
+		if (ctx && ctx.systemPrompt && typeof ctx.systemPrompt.getSectionOrder === "function") {
+			return ctx.systemPrompt.getSectionOrder("DEPLOYMENT_PERSONA_PREFIX");
+		}
+	} catch { /* 旧版引擎 */ }
+	return PERSONA_ORDER;
+}
 
 const name = "@deepseek-ai/dsh-prompt-custom";
 const inject = ["settings", "systemPrompt", "webServer"];
@@ -116,10 +134,11 @@ function apply(ctx, config) {
 		const cfg = liveConfig() || {};
 		if (!cfg.enabled || !String(cfg.text || "").trim()) return;
 		const text = String(cfg.text).trim();
+		const order = personaOrder(agent.ctx);
 		if (cfg.mode === "replace") {
-			agent.ctx.systemPrompt.section({ name: PERSONA_SECTION, order: PERSONA_ORDER, text });
+			agent.ctx.systemPrompt.section({ name: PERSONA_SECTION, order, text });
 		} else {
-			agent.ctx.systemPrompt.section({ name: "dsh:custom-prompt", order: PERSONA_ORDER + 1, text });
+			agent.ctx.systemPrompt.section({ name: "dsh:custom-prompt", order: order + 1, text });
 		}
 	});
 

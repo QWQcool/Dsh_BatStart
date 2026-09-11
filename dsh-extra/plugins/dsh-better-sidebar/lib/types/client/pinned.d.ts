@@ -79,8 +79,7 @@ export declare function pinnedVisibleTo(tab: SidebarTab, viewer: PinnedViewer): 
  * Collect every pinned terminal visible to the viewer across ALL cached
  * session states. Excludes the viewer's own session (those tabs are on its
  * own strip). Order is stable: sessions in the cache's insertion order,
- * tabs in tree order (splits → bottomSplits → floats) within each session
- * — the order tabs were opened/pinned, so the rail never reorders between
- * renders.
+ * tabs in tree order within each session — the order tabs were
+ * opened/pinned, so the rail never reorders between renders.
  */
 export declare function collectPinnedTabs(bySession: ReadonlyMap<string, SidebarState>, viewer: PinnedViewer): PinnedTabEntry[];

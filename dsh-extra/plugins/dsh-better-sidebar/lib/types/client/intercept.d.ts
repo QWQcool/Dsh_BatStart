@@ -4,9 +4,8 @@ import { type SidebarStore } from './state.ts';
 export declare function openSidebarFile(ctx: Context, store: SidebarStore, sessionId: string, path: string): void;
 /**
  * Reveal the produced files in the sidebar explorer: expand their parent
- * directories, highlight the rows, and focus the explorer tab (expanding the
- * hosting panel when it is collapsed). Unknown files fall back to revealing
- * the workspace root itself.
+ * directories, highlight the rows, and focus the explorer tab. Unknown
+ * files fall back to revealing the workspace root itself.
  */
 export declare function revealInExplorer(ctx: Context, store: SidebarStore, sessionId: string, files: readonly string[]): void;
 /** The intercepted produced-files row (visual twin of the deliverables chips). */
@@ -31,14 +30,3 @@ export declare function SidebarProducedFiles(props: {
  * @deepseek-ai/dsh-client-ui-deliverables' registration of the same slot.
  */
 export declare function registerTurnTailInterception(ctx: Context, store: SidebarStore): () => void;
-/**
- * Register the chat file-open interception: wraps `ctx.workspaces.openPath`
- * — the single funnel every chat-side file open goes through (tool-row path
- * links, the produced-files row, prose mentions) — so opens land in the
- * sidebar editor instead of the Host OS. The folder-reveal gesture ("Show in
- * folder" passes `'.'`) is the one exception: it is routed to the explorer.
- * Gated by BOTH the `interceptOpenPath` pref and the editor tab's enable
- * switch; declined opens fall through to the original method. Returns the
- * disposer restoring the original (HMR-safe).
- */
-export declare function registerOpenPathInterception(ctx: Context, store: SidebarStore): () => void;

@@ -1,48 +1,32 @@
 /**
- * Layout push: when a panel is open it OCCUPIES the layout instead of
- * floating over it — the app shell (#root, the AppFrame three-column grid)
- * gives up space. Only the center column is flexible (1fr), so the right
- * panel's width squeeze (margin-right on #root) lands exactly on the
- * conversation output and the input bar, like a VSCode sidebar.
+ * Layout push: the bottom workbench occupies layout instead of floating over
+ * the conversation. The right column belongs to DSH's native Sidebar, so this
+ * stylesheet pushes no width — only the workbench's height.
  *
- * The width rides `calc(100% - var(...))` instead of a bare margin on a
- * full-width box: some desktop shells (DSH Desktop, #208) set #root to
- * width:100%, where a margin would overflow the viewport additively —
- * the calc keeps the box at exactly 100% minus the push in every shell.
- * Width and margin transition in lockstep (same variable, same duration
- * and easing), so expand/collapse animates the content width exactly as
- * the bare-margin version did.
+ * The workbench squeezes only the conversation column. The anchor is the
+ * [data-dsh-center-col] tag the Sidebar shell's locator writes on the
+ * frame's measured center grid item (Sidebar.tsx locate — not a positional
+ * path: the frame also contains an overlay layer and drag handles). A
+ * stretched grid item shrinks by its bottom margin, so the conversation
+ * output and composer lift without touching either sidebar.
  *
- * The bottom panel squeezes ONLY the center column — it must not cover the
- * app's own left sidebar or the right panel. The anchor is the frame's
- * center grid item via its stable data attribute ([data-pane="conversation"]
- * on the centerCol inside [data-dsh-frame]), not a positional path: the
- * frame's child order also contains an overlay layer and drag handles
- * (verified against a live DSH 0.1.x page), so nth-child is brittle. A
- * stretched grid item shrinks by its margins, so the conversation content
- * (output + input bar) lifts without touching the sidebars.
- *
- * The sizes ride CSS variables updated by the Sidebar shell (0 while
- * collapsed); expand/collapse animates both the margins and the panel
- * slides on the same theme duration. Drags disable the transition so the
- * layout tracks the pointer.
+ * The size rides a CSS variable updated by the Sidebar shell (0 while
+ * collapsed). Expand/collapse uses the host theme duration; drags disable
+ * transitions so the reserved edge tracks the pointer.
  */
-#root {
-  margin-right: var(--dsh-sidebar-width, 0px);
-  width: calc(100% - var(--dsh-sidebar-width, 0px));
-  transition:
-    margin-right var(--ds-transition-duration-slow) var(--ds-ease-in-out),
-    width var(--ds-transition-duration-slow) var(--ds-ease-in-out);
-}
-
-/* The AppFrame's center column, anchored by data attributes (see above).
-   Composite selector: DSH 0.1.x versions name the center grid item
-   `[data-pane="conversation"]`, while rc.8-era shells put a
-   `[data-slot="conversation"]` child inside it — both selectors resolve to
-   the SAME element on live pages (verified), and keeping both future-proofs
-   the rule against a host rename without touching shell-specific markup. */
-#root [data-dsh-frame] > [data-pane="conversation"],
-#root :has(> [data-slot="conversation"]) {
+/* The AppFrame's center column. The Sidebar shell's locator (Sidebar.tsx
+   locate/measureCenter, resolving via center-column.ts) tags the measured
+   column node with [data-dsh-center-col] — one attribute write per node
+   lifetime. The locator anchors on the conversation slot host
+   (`main.conversation` on DSH 0.1.5-alpha.2+, `conversation` on alpha.1)
+   and skips the transparent display:contents slot hosts above it. The rule
+   used to anchor on a structural has()-selector over the conversation slot
+   wrapper, whose match cache invalidates on every #root subtree mutation
+   (the streaming chat mutates it constantly), re-evaluating the selector
+   against the whole document; the tag is evaluated once per node instead.
+   A stretched grid item shrinks by its margins, so the conversation
+   content (output + input bar) lifts without touching the sidebars. */
+#root [data-dsh-center-col] {
   margin-bottom: var(--dsh-sidebar-height, 0px);
   /* Grid/flex items default to min-height:auto. A long unbreakable token
      (OAuth URL) then grows this column past the viewport and clips the
@@ -67,9 +51,7 @@ body[data-dsh-sidebar-collapsed] [data-slot="conversation.session.header"] > hea
   padding-right: 78px;
 }
 
-body[data-dsh-sidebar-dragging] #root,
-body[data-dsh-sidebar-dragging] #root [data-dsh-frame] > [data-pane="conversation"],
-body[data-dsh-sidebar-dragging] #root :has(> [data-slot="conversation"]) {
+body[data-dsh-sidebar-dragging] #root [data-dsh-center-col] {
   transition: none;
 }
 
@@ -93,9 +75,67 @@ body[data-dsh-sidebar-dragging] #root :has(> [data-slot="conversation"]) {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  #root,
-  #root [data-dsh-frame] > [data-pane="conversation"],
-  #root :has(> [data-slot="conversation"]) {
+  #root [data-dsh-center-col] {
     transition: none;
   }
+}
+
+/* Context-menu submenu flip (viewport clamping for the portaled menus).
+ *
+ * The ui-primitives Menu clamps its main portal list into the viewport but
+ * positions nested submenus with static CSS only — anchored at the parent
+ * row's bottom, growing UP and to the RIGHT — with no clamp whatsoever.
+ * Both defaults are the worst case for our menus: a tall "open with" submenu
+ * escapes past the viewport top when the row menu opens near the top, and
+ * past the right edge in a narrow workbench pane (a pane can be far narrower
+ * than the card 218 + gap + submenu 165 a submenu needs).
+ *
+ * menu-flip.ts publishes `data-dsh-sidebar-submenu` on <body> — with the
+ * words "down" and/or "left" — for exactly the lifetime of one of OUR
+ * submenu-bearing menus (FileTree row menu, TabBar tab menu). The tokens
+ * flip the growth direction; the attribute's absence restores the
+ * primitive's own geometry untouched, and host-owned menus are never
+ * affected because they never open while the attribute exists (each side
+ * closes on the other's outside pointerdown).
+ *
+ * No max-height/overflow scroll cap here on purpose: overflow clipping
+ * would cut the submenu's ::before hover bridge (the corridor that keeps
+ * itemWrap's mouseleave from closing the card mid-crossing). */
+
+/* Visual tether, part 1 — the parent row stays lit while its submenu is
+ * open. The primitive only styles :hover, so once the pointer crossed into
+ * the side card the parent row's fill cleared and the floating card read as
+ * unrelated. The Menu marks the open parent row with aria-expanded="true"
+ * (host-rendered, stable), so the same hover token re-applies for the
+ * submenu's whole lifetime. */
+body[data-dsh-sidebar-submenu] div[role="menu"] button[aria-expanded="true"] {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* Visual tether, part 2 — the side card hugs its parent (10px → 4px gap),
+ * with the ::before hover corridor narrowed to match. Ordered BEFORE the
+ * flip overrides below so their left/right flips still win. */
+body[data-dsh-sidebar-submenu] div[role="menu"] div[role="menu"] {
+  left: calc(100% + 4px);
+}
+
+body[data-dsh-sidebar-submenu] div[role="menu"] div[role="menu"]::before {
+  left: -4px;
+  width: 4px;
+}
+
+body[data-dsh-sidebar-submenu~="down"] div[role="menu"] div[role="menu"] {
+  top: -4px;
+  bottom: auto;
+}
+
+body[data-dsh-sidebar-submenu~="left"] div[role="menu"] div[role="menu"] {
+  left: auto;
+  right: calc(100% + 4px);
+}
+
+/* The hover bridge follows the card to the left side of the parent row. */
+body[data-dsh-sidebar-submenu~="left"] div[role="menu"] div[role="menu"]::before {
+  left: auto;
+  right: -4px;
 }

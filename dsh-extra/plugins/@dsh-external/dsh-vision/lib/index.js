@@ -39,7 +39,7 @@ const PROMPT_TEXT = `## Vision — two independent paths (keep both)
 There are TWO ways to see images. They are not alternatives to uninstall; both stay available.
 
 ### 1) Native chat vision (DSH / DeepSeek Flash Vision)
-When the selected chat model accepts images (for example \`deepseek-v4-flash-vision-exp\`) AND the user attached/pasted an image in this conversation, look at those attached image blocks yourself. Do not refuse, and do not call view_image just to re-send an image that is already in the message.
+When the selected chat model accepts images (for example \`DeepSeek-V41-Flash\` / \`deepseek-flash\`, the 0.1.5+ default, or \`deepseek-v4-flash-vision-exp\`) AND the user attached/pasted an image in this conversation, look at those attached image blocks yourself. Do not refuse, and do not call view_image just to re-send an image that is already in the message.
 
 ### 2) External vision tool (view_image) — always keep using this path when native cannot see the file
 \`view_image\` talks to a separate OpenAI-compatible VLM (default: Zhipu glm-4.6v-flash, not the DeepSeek chat model). It stays registered even when native vision is on. Call it when:

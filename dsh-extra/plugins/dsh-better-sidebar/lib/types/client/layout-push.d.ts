@@ -1,15 +1,10 @@
-export interface LayoutPushInput {
-    narrow: boolean;
-    panelOpen: boolean;
-    bottomOpen: boolean;
-    width: number;
-    bottomHeight: number;
-    viewportWidth: number;
+export interface BottomPushInput {
+    /** Whether the bottom workbench is expanded. */
+    open: boolean;
+    /** Committed (or mid-drag) bottom height in px. */
+    height: number;
+    /** Viewport height the cap is measured against (visual viewport when known). */
     viewportHeight: number;
 }
-export interface LayoutPushSize {
-    width: number;
-    height: number;
-}
-/** Compute the live layout-push size. Narrow drawers float and push 0. */
-export declare function layoutPushSize(input: LayoutPushInput): LayoutPushSize;
+/** Compute the live layout-push height for the bottom workbench. */
+export declare function bottomPushHeight(input: BottomPushInput): number;

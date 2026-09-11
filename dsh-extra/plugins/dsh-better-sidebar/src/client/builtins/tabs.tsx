@@ -1,13 +1,14 @@
 /**
  * The 7 built-in tab descriptors: the plugin registers its own pages
- * (editor / git / subagent / sidechat / terminal / browser / diff) through
+ * (editor / git — the unified changes tab / subagent / sidechat / terminal /
+ * browser / diff) through
  * the same {@link BetterSidebarService} external plugins use — eating its
  * own dogfood. The terminal descriptor owns its quota (`TERMINAL_LIMIT`)
  * and mints `terminal:<uuid>` ids through `createTab`; the browser mints
  * `browser:<n>` the same way (no quota). The editor IS the files window
  * (the old standalone explorer merged into it).
  */
-import { IconBranchOutline16, IconCodeOutline16, IconFolderOpen16, IconNewChatOutline16, IconPanelLeftOutline16, IconThinkOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconCodeOutline16, IconFolderOpen16, IconNewChatOutline16, IconPanelLeftOutline16, IconThinkOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context } from '../../context-types.ts'
 import { allLeaves, isAgentTabId, type SidebarState } from '../state.ts'
 import { t } from '../locales.ts'
@@ -15,7 +16,7 @@ import { openSidebarFile } from '../intercept.tsx'
 import { EditorHost } from '../EditorHost.tsx'
 import { OpenWithSettings } from '../open-with-settings.tsx'
 import { lazyChunkComponent } from '../lazy-chunk.tsx'
-import { GitView } from '../GitView.tsx'
+import { ChangesTab, opCountOf } from '../changes/ChangesTab.tsx'
 import { DiffTab } from '../DiffTab.tsx'
 import { SubagentView } from '../SubagentView.tsx'
 import { consumeSidechatSeed, SideChatView, sidechatThreadIdOf } from '../SideChatView.tsx'
@@ -71,7 +72,7 @@ function terminalUuid(): string {
 
 /** Count UI-owned terminals (agent:` tabs excluded — they are the model's). */
 function uiTerminalCount(state: SidebarState): number {
-  return allLeaves(state.splits)
+  return allLeaves(state.bottomSplits)
     .flatMap(leaf => leaf.tabs)
     .filter(tab => tab.type === 'terminal' && !isAgentTabId(tab.id)).length
 }
@@ -81,6 +82,7 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
   return [
     {
       id: 'editor',
+      description: () => t('guideDescFiles'),
       // The single files window: an editor tab with no path IS the file
       // explorer (empty hint + docked tree); with a path it previews/edits
       // the file. Visible in the + menu in the explorer's old slot.
@@ -91,9 +93,11 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
       dedupeKey: (tab) => tab.path,
       // Declarative settings: the file-open behavior picker (in-place switch
       // vs per-path windows) renders as an iconed select row under the
-      // editor card's gear in the Side card settings page; the "open with"
-      // configuration (SSH host + custom editors) is the custom panel BELOW
-      // those rows — the settings seam renders rows first, custom panel after.
+      // editor card's gear in the Side card settings page, followed by the
+      // workspace fence switch (the host's containment guard over every
+      // sidebar filesystem route); the "open with" configuration (SSH host +
+      // custom editors) is the custom panel BELOW those rows — the settings
+      // seam renders rows first, custom panel after.
       settings: {
         toggles: [{
           key: 'editorExplorer',
@@ -114,6 +118,10 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
               desc: () => t('editorExplorerSplitDesc'),
             },
           ],
+        }, {
+          key: 'workspaceFence',
+          title: () => t('settingsFenceTitle'),
+          desc: () => t('settingsFenceDesc'),
         }],
         render: ({ pluginSettings, updatePluginSetting }) => (
           <OpenWithSettings pluginSettings={pluginSettings} updatePluginSetting={updatePluginSetting} />
@@ -133,28 +141,43 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
       ),
     },
     {
+      // The unified changes tab (id kept as 'git' so persisted layouts keep
+      // resolving): the Git lens is the former source-control panel; the
+      // session lens is the former file-trace tab (PR #471). Both preview
+      // through one shared diff stack. The badge reads the op-count cache
+      // the tab's event poll publishes (the client ctx exposes no event
+      // log, and the git status needs a fetch — both stay out of the badge).
       id: 'git',
-      title: () => t('git'),
-      icon: (size: number) => <IconBranchOutline16 size={size} />,
+      title: () => t('changes'),
+      description: () => t('guideDescGit'),
+      icon: (size: number) => <IconDiffOutline16 size={size} />,
       order: 20,
       single: true,
-      component: ({ ctx, store, scope, visible, onOpenDiff }) => (
-        <GitView
+      badge: (_ctx, scope) => {
+        const count = opCountOf(scope.sessionId)
+        return count === undefined || count === 0 ? null : count
+      },
+      component: ({ ctx, store, scope, tab, visible, onOpenDiff }) => (
+        <ChangesTab
+          ctx={ctx}
+          store={store}
           scope={scope}
+          tab={tab}
           visible={visible}
           onOpenFile={(path) => { openSidebarFile(ctx, store, scope.sessionId, path) }}
-          onOpenDiff={onOpenDiff ?? (() => { /* no-op */ })}
+          onOpenDiff={onOpenDiff}
         />
       ),
     },
     {
       id: 'subagent',
       title: () => t('subagent'),
+      description: () => t('guideDescSubagent'),
       icon: (size: number) => <IconThinkOutline16 size={size} />,
       order: 30,
       single: true,
       // Declarative settings: the auto-open switches render under this row in
-      // the Side card settings page (the Jobs page's own related settings).
+      // the Side card settings page (the Tasks page's related settings).
       settings: {
         toggles: [{
           key: 'autoOpenSubagent',
@@ -178,6 +201,7 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
     {
       id: 'sidechat',
       title: () => t('sideChat'),
+      description: () => t('guideDescSidechat'),
       icon: (size: number) => <IconNewChatOutline16 size={size} />,
       order: 35,
       // Codex-style: EVERY side conversation is its own tab. A plain open
@@ -223,6 +247,7 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
     {
       id: 'terminal',
       title: () => t('terminal'),
+      description: () => t('guideDescTerminal'),
       icon: (size: number) => <IconTerminalOutline16 size={size} />,
       order: 40,
       available: (_ctx, _scope, state) => uiTerminalCount(state) < TERMINAL_LIMIT,
@@ -287,6 +312,7 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
     {
       id: 'browser',
       title: () => t('browser'),
+      description: () => t('guideDescBrowser'),
       icon: (size: number) => <IconGlobeOutline16 size={size} />,
       order: 50,
       // Declarative settings: the sandbox escape hatch, the link-takeover
@@ -330,7 +356,7 @@ export function builtinTabs(ctx: Context, options: BuiltinTabOptions = {}): read
     },
     {
       id: 'diff',
-      title: () => t('git'),
+      title: () => t('changes'),
       icon: (size: number) => <IconDiffOutline16 size={size} />,
       order: -1,
       hidden: true,

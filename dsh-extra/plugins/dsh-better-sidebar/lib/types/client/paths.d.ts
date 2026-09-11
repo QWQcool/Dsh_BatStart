@@ -41,3 +41,15 @@ export declare function relativeTo(cwd: string, path: string): string;
  * the session workspace cannot: the host's workspace fence would reject it).
  */
 export declare function isWithinWorkspace(base: string, target: string): boolean;
+/**
+ * The last path segment of a '/'- or '\'-separated path (a diff tab title,
+ * a worktree label). Returns the whole string when no separator is present.
+ */
+export declare function baseName(path: string): string;
+/**
+ * The lowercased file extension of a path ('' when none). The dot must sit
+ * inside the last segment — a dot in a directory name is not an extension.
+ * Shared by the editor language mapping (lang.ts) and the viewer registry's
+ * extension matching (service.ts), which both live in the core bundle.
+ */
+export declare function extOf(path: string): string;

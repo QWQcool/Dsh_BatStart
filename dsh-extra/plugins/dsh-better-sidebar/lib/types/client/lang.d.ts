@@ -4,8 +4,8 @@
  * the CodeMirror language packages (bundled into the client).
  */
 import { Language, LanguageSupport } from '@codemirror/language';
-/** The lowercased file extension of a path ('' when none). */
-export declare function extOf(path: string): string;
+import { extOf } from './paths.ts';
+export { extOf };
 /** Language key for an extension, or null for plain text. Pure (tested). */
 export declare function languageKeyForExt(ext: string): string | null;
 /** Every language key the extension table can produce (test seam). */

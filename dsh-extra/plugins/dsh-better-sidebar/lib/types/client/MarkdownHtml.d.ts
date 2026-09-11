@@ -1,10 +1,11 @@
 import { type ReactNode } from 'react';
 import { type AnalyzedMarkdownHtml } from './markdown-html.ts';
-import { type MermaidMarkdownProps } from './mermaid-blocks.ts';
 import type { SessionScope } from './api.ts';
 /** The chunk-resident markdown renderer (mermaid lazy chunk), shared with the
- *  legacy no-HTML preview path in TextEditor. */
-export declare const LazyMermaidMarkdown: (props: MermaidMarkdownProps) => ReactNode;
+ *  legacy no-HTML preview path in TextEditor. Defined in mermaid-lazy.tsx (a
+ *  light module) so core-bundle consumers can import the stub without
+ *  dragging DOMPurify along. */
+export { LazyMermaidMarkdown } from './mermaid-lazy.tsx';
 /** Everything the sanitizers need to resolve local media + scope the route. */
 export interface MarkdownHtmlMedia {
     scope: SessionScope;
@@ -29,4 +30,3 @@ interface MarkdownDocumentProps {
  * parser would. Sanitization runs once per prepared change, in a memo.
  */
 export declare function MarkdownDocument({ info, media, codeLabels }: MarkdownDocumentProps): ReactNode;
-export {};

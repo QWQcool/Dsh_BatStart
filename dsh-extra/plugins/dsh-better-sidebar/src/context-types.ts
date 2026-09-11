@@ -87,11 +87,12 @@ export interface SidebarSessionStore {
   get(id: string): {
     header: SidebarSessionHeader
     /**
-     * The live session's append-only event log (immutable snapshot; absent
-     * on sessions the runtime has not hydrated). Read-only access — the
-     * jobs.output route replays `job_output` tool/result rows from it.
+     * The live session's append-only event log as an immutable snapshot.
+     * Read-only access — the jobs.output route replays `job_output`
+     * tool/result rows from it. (The `Session.events` property this face
+     * mirrored was renamed to `snapshotEvents()` in DSH 0.1.2-alpha.4.)
      */
-    events?: readonly SidebarSessionEvent[]
+    snapshotEvents(): readonly SidebarSessionEvent[]
   } | undefined
 }
 
@@ -118,6 +119,7 @@ export interface SidebarSlotRegisterOptions {
   locale?: string
   registrant?: string
   /** Business-face factory; args depend on the slot scope. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mirrors the host slots signature, where inject args are untyped; unknown[] would reject concrete-typed implementations (contravariance)
   inject?: (...args: any[]) => Record<string, unknown>
   children?: Record<string, unknown>
 }
@@ -294,47 +296,34 @@ export interface SidebarSessionTitleService {
   rename(session: unknown, title: string): { title: string; eventSeq: number }
 }
 
-/** The host session-persistence face (mirror of the sessionPersistence
- *  service): detached inspection of a persisted session, used to compose the
- *  recorded preset when a Side Chat thread cold-resumes. */
+/**
+ * The host session-persistence face (mirror of the `sessionPersistence`
+ * service): durable, handle-addressed session storage.
+ *
+ * DSH 0.1.5 replaced the detached `inspect(id)` call with an explicit read
+ * handle: `open(id, 'read')` never takes write ownership and works while
+ * another process owns the session, `handle.read()` returns one contiguous
+ * slice of the log, and `close()` releases it. Every cold read in this plugin
+ * goes through {@link readPersistedSession} so the handle is always closed.
+ */
 export interface SidebarSessionPersistenceService {
-  inspect(sessionId: string): Promise<{
-    meta: { cwd?: string; agentPreset?: string }
-    events: readonly SidebarSessionEvent[]
-  }>
+  open(sessionId: string, access: 'read' | 'write'): Promise<SidebarSessionHandle>
 }
 
-/** RPC result slot mirror (`RpcResult<T>` on the wire). */
-export type SidebarRpcResult<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string } }
-
-/** Unary response mirror (`RpcResponse<T>` on the wire). */
-export interface SidebarRpcResponse<T> {
-  rpcId: unknown
-  result: SidebarRpcResult<T>
-}
-
-/** The generic session-history RPC face the Side Chat transcript polls
- *  (subagent.history verifies subagent-catalog membership, which our custom
- *  side-thread children do not have — the generic session.history reads any
- *  durable log directly). */
-export interface SidebarSessionHistoryRpc {
-  history(
-    payload: { sessionId: string; beforeSeq?: number; maxMessages?: number },
-    signal?: AbortSignal,
-  ): Promise<SidebarRpcResponse<{ events: SidebarHistoryEntry[]; hasMore: boolean }>>
-}
-
-/** The wire face the Subagent activity summary needs (subset of `ctx.connection`). */
-export interface SidebarConnectionHandle {
-  api: {
-    sessions: SidebarSessionHistoryRpc
-    subagents: {
-      history(
-        payload: SidebarSubagentAddress & { beforeSeq?: number; maxMessages?: number },
-        signal?: AbortSignal,
-      ): Promise<SidebarRpcResponse<{ events: SidebarHistoryEntry[]; hasMore: boolean }>>
-    }
-  }
+/** One open channel onto a stored session (the fields this plugin reads). */
+export interface SidebarSessionHandle {
+  /** Immutable stored header (cwd / agentPreset live here). */
+  readonly header: { cwd?: string; agentPreset?: string } & Record<string, unknown>
+  /** Exact fork-inherited prefix length stored with the log. */
+  readonly inheritedEventCount?: number
+  /**
+   * Read a slice of the valid contiguous log.
+   * @param offset - first logical seq to include (defaults to 0).
+   * @param length - maximum events (defaults to the rest of the log).
+   */
+  read(offset?: number, length?: number): Promise<{ events: readonly SidebarSessionEvent[] }>
+  /** Release the handle (idempotent). */
+  close(): Promise<void>
 }
 
 /** The client session list snapshot the sidebar subscribes to. */
@@ -423,9 +412,10 @@ export interface SidebarLocaleService {
 
 /** The composer draft face the sidebar reaches through `ctx.conversation.input`. */
 export interface SidebarSessionInput {
-  /** The live input store (draft read for append). */
+  /** The live input store (draft read for append). `draftRev` is the machine's
+   *  span-CAS revision — required to mint a structured file-reference chip. */
   state: {
-    getSnapshot(): { draft: string }
+    getSnapshot(): { draft: string; draftRev?: number }
   }
   /** Replace the draft text (the input machine's single public write path). */
   setDraft(text: string): void
@@ -436,17 +426,6 @@ export interface SidebarConversation {
   input: {
     for(actx: Context): SidebarSessionInput
   }
-}
-
-/**
- * The client workspaces service face (mirror of the runtime IWorkspaces). Only
- * the chat's file-open funnel is touched: `openPath` hands an absolute path
- * to the Host OS's default application, and every chat-side file open
- * (tool rows, produced-files, prose mentions) funnels through it.
- */
-export interface SidebarWorkspacesService {
-  /** Open a filesystem path with the Host operating system's default application. */
-  openPath(path: string): Promise<void>
 }
 
 /**
@@ -527,14 +506,10 @@ export interface SidebarContextShape {
   webServer: SidebarWebServer
   /** The session store (host `.get`) and the client list feed (`.list`) faces. */
   sessions: SidebarSessionStore & SidebarSessionsService
-  /** The wire handle the Side Chat transcript polls through. */
-  connection: SidebarConnectionHandle
   /** The web runtime trust list (bind-derived). */
   webRuntime: SidebarWebRuntime
   /** The client slot registry (register/inject). */
   slots: SidebarSlotsService
-  /** The client workspaces service face (file-open funnel). */
-  workspaces: SidebarWorkspacesService
   /** The settings service face (prefs persistence + namespace reads). */
   settings: SidebarSettingsService
   /** The invariant registry face. */
@@ -557,6 +532,19 @@ export interface SidebarContextShape {
   sessionTitle: SidebarSessionTitleService
   /** The host session-persistence service (optional; side chat cold resume). */
   sessionPersistence: SidebarSessionPersistenceService
+  /**
+   * The client connection lifecycle (DSH 0.1.2-alpha.2+; optional so older
+   * hosts and test fakes simply hide the disconnect banner): the observable
+   * recovery state of the Remote transport (`undefined` before the first
+   * connection outcome) and an immediate-reconnect request.
+   */
+  connection?: {
+    state: {
+      getSnapshot(): 'connected' | 'disconnected' | 'connecting' | undefined
+      subscribe(listener: () => void): () => void
+    }
+    reconnect(): void
+  }
   /** The composer draft face (client ui-conversation, lazy `ctx.get` probe). */
   conversation: SidebarConversation
   /**
@@ -572,6 +560,13 @@ export interface SidebarContextShape {
    * LIVE Session instance that appended it.
    */
   on(event: string, listener: (session: unknown, event: SidebarSessionEvent) => void): () => void
+  /**
+   * The agent's process-local assistant stream (DSH 0.1.5+): one payload per
+   * `start` / `chunk` / `end` frame, carrying the emitting agent and the
+   * frame. These frames are NOT session events — see
+   * {@link ./assistant-live.ts} for why the plugin needs them.
+   */
+  on(event: 'agent/assistant-stream', listener: (payload: { agent?: unknown; frame?: unknown }) => void): () => void
 }
 
 /**

@@ -127,17 +127,38 @@ function deployPersona() {
     dedup.push(p);
   }
   patch = dedup;
-  // 幂等：已有 persona 覆盖则跳过
-  const has = patch.some((p) => p && p.id === "system-prompt" && p.config && String(p.config.persona || "").includes(MARK));
-  if (!has) {
+  // 0.1.5 起 @deepseek-ai/dsh-system-prompt 把 persona 拆成 personaPrefix /
+  // personaSuffix（旧字段 persona 已删除）。旧配置必须就地改名：否则 schema
+  // 校验不过；而「再追加一条 system-prompt」会触发
+  // duplicate loader entry id: system-prompt，让 dsh web 直接起不来。
+  const row = patch.find((p) => p && p.id === "system-prompt");
+  if (row) {
+    row.config = row.config || {};
+    if (row.config.persona !== undefined) {
+      if (row.config.personaPrefix === undefined) row.config.personaPrefix = row.config.persona;
+      delete row.config.persona;
+      log("persona 字段已迁移：persona -> personaPrefix（0.1.5 起）");
+    }
+  }
+  // 幂等：已有 personaPrefix 覆盖则跳过；自定义文本（不含标记）保留不动
+  const current = String(((row && row.config) || {}).personaPrefix || "");
+  const has = current.includes(MARK);
+  const custom = !has && current.trim() !== "";
+  if (custom) {
+    log("persona 已被自定义（不含 oh-we-need 标记），保留不改");
+  } else if (has) {
+    log("persona（oh-we-need）已注入，跳过");
+  } else if (row) {
+    row.name = "@deepseek-ai/dsh-system-prompt";
+    row.config.personaPrefix = OH_WE_NEED_PERSONA;
+    log("persona（oh-we-need）已更新 " + PATCH_FILE);
+  } else {
     patch.push({
       id: "system-prompt",
       name: "@deepseek-ai/dsh-system-prompt",
-      config: { persona: OH_WE_NEED_PERSONA },
+      config: { personaPrefix: OH_WE_NEED_PERSONA },
     });
     log("persona（oh-we-need）已注入 " + PATCH_FILE);
-  } else {
-    log("persona（oh-we-need）已注入，跳过");
   }
   // 无论是否追加，都把（去重后的）结果写回，避免历史重复条目残留
   writePatch(patch);
@@ -508,11 +529,11 @@ function reportLoadedPlugins() {
   const slotsInject = path.join(PLUGIN_DST, "dsh-better-sidebar", "package.json");
   try {
     const inj = JSON.parse(fs.readFileSync(slotsInject, "utf8")).dsh?.client?.inject || [];
-    if (inj.includes("@deepseek-ai/dsh-client-ui-slots")) {
-      const have = fs.existsSync(path.join(REPO, "node_modules", "@deepseek-ai", "dsh-client-ui-slots", "package.json"));
-      if (!have) {
-        warn("dsh-better-sidebar 仍 inject @deepseek-ai/dsh-client-ui-slots，当前引擎未带此包（等插件作者适配 0.1.1，不阻止启动）");
-      }
+    const peers = ["@deepseek-ai/dsh-client-ui-slots", "@deepseek-ai/dsh-client-ui-primitives"];
+    const missing = peers.filter((n) => !fs.existsSync(path.join(REPO, "node_modules", ...n.split("/"), "package.json")));
+    if (inj.includes(peers[0]) && missing.length) {
+      warn("dsh-better-sidebar 需要宿主提供 " + missing.join(" / ") + "，0.1.5 引擎已不再随包安装，离线副本也补不了 peer。"
+        + "侧边栏要用请走官方安装（会顺带装 peer）：dsh plugin --profile web add dsh-better-sidebar@latest。不阻止主界面启动。");
     }
   } catch { /* sidebar not deployed */ }
 }
