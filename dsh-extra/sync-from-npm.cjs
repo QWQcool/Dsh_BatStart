@@ -16,9 +16,12 @@
 
 const fs = require("fs");
 const path = require("path");
-const { registryUrl, viewVersion, viewVersionFrom, npmInstall, REPO } = require("./npm-registry.cjs");
+const { registryUrl, viewVersionFrom, viewDistTag, npmInstall, REPO } = require("./npm-registry.cjs");
 
 const PKG = "@deepseek-ai/dsh";
+// `latest` can lag behind the line the desktop client ships (0.2.0-rc.2 vs
+// 0.2.1-rc.2). Set DSH_CHANNEL=next (or alpha) to follow that tag instead.
+const CHANNEL = String(process.env.DSH_CHANNEL || "latest").trim() || "latest";
 const DSH_DIR = path.join(REPO, "node_modules", "@deepseek-ai", "dsh");
 const DSH_BIN = path.join(DSH_DIR, "lib", "bin.js");
 const PKG_JSON = path.join(REPO, "package.json");
@@ -77,7 +80,7 @@ function main() {
   const have = localVersion();
   log("local " + PKG + " = " + (have || "(missing)"));
 
-  const want = viewVersion(PKG, 15000);
+  const want = viewDistTag(PKG, CHANNEL, 15000);
   if (!want) {
     warn("npm view failed (offline?). Keep local engine.");
     if (!engineOk()) {
@@ -88,9 +91,9 @@ function main() {
   }
   const mirror = viewVersionFrom(registryUrl(), PKG, 8000);
   if (mirror && mirror !== want) {
-    log("npmjs latest " + PKG + " = " + want + " (mirror still " + mirror + ")");
+    log("npmjs " + CHANNEL + " " + PKG + " = " + want + " (mirror still " + mirror + ")");
   } else {
-    log("npm latest " + PKG + " = " + want);
+    log("npm " + CHANNEL + " " + PKG + " = " + want);
   }
 
   if (have === want && engineOk()) {

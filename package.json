@@ -1,9 +1,9 @@
 {
   "name": "dsh-batstart",
   "private": true,
-  "description": "One-click DeepSeek Harness web launcher (Windows). Companion plugins and dsh-trivium are not identical to DSH Desktop.",
+  "description": "Fallback DeepSeek Harness web launcher (Windows) plus the dsh-trivium memory plugin. The official desktop client is the primary path.",
   "license": "MIT",
   "dependencies": {
-    "@deepseek-ai/dsh": "0.1.5-rc.1"
+    "@deepseek-ai/dsh": "0.2.1-rc.2"
   }
 }

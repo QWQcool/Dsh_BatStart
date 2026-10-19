@@ -67,6 +67,36 @@ function viewVersion(pkg, timeoutMs) {
   return official;
 }
 
+function viewDistTagFrom(registry, pkg, tag, timeoutMs) {
+  const r = cp.spawnSync(
+    npmCmd(),
+    ["view", pkg, "dist-tags." + tag, "--registry=" + registry],
+    {
+      cwd: REPO,
+      encoding: "utf8",
+      timeout: timeoutMs || 15000,
+      shell: process.platform === "win32",
+      windowsHide: true,
+    }
+  );
+  return parseVersionStdout(r.stdout, r.status);
+}
+
+/**
+ * Version behind a named dist-tag (`latest` / `next` / `alpha`).
+ *
+ * `latest` on this package can lag behind `next` for weeks (0.2.0-rc.2 vs
+ * 0.2.1-rc.2), so the launcher exposes DSH_CHANNEL instead of assuming the
+ * newest stable line is `latest`.
+ */
+function viewDistTag(pkg, tag, timeoutMs) {
+  const t = timeoutMs || 15000;
+  const name = tag || "latest";
+  const official = viewDistTagFrom(OFFICIAL, pkg, name, t);
+  if (official) return official;
+  return viewDistTagFrom(registryUrl(), pkg, name, t);
+}
+
 function npmInstall(args, opts) {
   const spawnOpts = {
     encoding: "utf8",
@@ -93,5 +123,7 @@ module.exports = {
   installRegistries,
   viewVersion,
   viewVersionFrom,
+  viewDistTag,
+  viewDistTagFrom,
   npmInstall,
 };

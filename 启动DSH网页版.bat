@@ -64,9 +64,13 @@ if exist "%SCRIPT_DIR%\.env" (
   )
 )
 
-:: 4) follow npm latest for @deepseek-ai/dsh (other clones do not wait for git)
+:: 4) follow npm for @deepseek-ai/dsh (other clones do not wait for git)
+::    DSH_CHANNEL defaults to next so the fallback launcher matches the line
+::    the official desktop client ships (latest can lag behind for weeks).
+::    Override with: set DSH_CHANNEL=latest   (or alpha)
+if not defined DSH_CHANNEL set "DSH_CHANNEL=next"
 if exist "%SCRIPT_DIR%\dsh-extra\sync-from-npm.cjs" (
-  echo [Dsh_BatStart] checking npm for @deepseek-ai/dsh updates
+  echo [Dsh_BatStart] checking npm (%DSH_CHANNEL%) for @deepseek-ai/dsh updates
   "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\sync-from-npm.cjs"
 )
 if not exist "%DSH_BIN%" (
@@ -75,10 +79,10 @@ if not exist "%DSH_BIN%" (
   goto :eof
 )
 
-:: 4.5) deploy dsh-extra (companion plugins / presets / oh-we-need / dsh-trivium, idempotent)
-if exist "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs" (
-  echo [Dsh_BatStart] deploying companion plugins / presets / global prompt / dsh-trivium
-  "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\deploy-extra.cjs"
+:: 4.5) install dsh-trivium into the web profile (idempotent)
+if exist "%SCRIPT_DIR%\dsh-extra\install-trivium.cjs" (
+  echo [Dsh_BatStart] installing dsh-trivium memory plugin
+  "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\install-trivium.cjs"
 )
 
 :: 5) start server in a new window; its output is logged to dsh-server.log

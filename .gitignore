@@ -16,15 +16,14 @@ dsh-home/
 # 项目记忆文件本地维护、不入库（即使未来放开 .workbuddy/ 也不跟踪）
 .workbuddy/memory/
 
-# ===== npm 锁文件（引擎由 .bat 跟 npm latest 安装，不入库）=====
+# ===== npm 锁文件（引擎由 .bat 跟 npm 通道安装，不入库）=====
 package-lock.json
-# 例外：离线伴侣插件需要 package.json 才能被 DSH Loader / client-modules 识别
-!dsh-extra/plugins/**/package.json
 
-# ===== 系统 / IDE =====
+# ===== 系统 / IDE / 工具产物 =====
 .DS_Store
 Thumbs.db
 desktop.ini
+.playwright-cli/
 
 # ===== 本地部署笔记（含本机细节，不公开）=====
 本地部署笔记.md

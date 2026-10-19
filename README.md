@@ -1,103 +1,112 @@
 # Dsh_BatStart
 
-一键启动 **DeepSeek Harness（DSH）网页版**：双击 `.bat`，浏览器打开本地服务。**自包含、不依赖 DSH Desktop**。
-
-引擎 **不进 git**。每次启动向 **npmjs.org** 查询 [`@deepseek-ai/dsh`](https://www.npmjs.com/package/@deepseek-ai/dsh) 的 `latest`，本机落后则自动升级（国内镜像未同步时回退到 npmjs 安装）。别人 clone 后同样直接跟 npm，不必等本仓库先推一版。
-
-当前引擎线是 **0.1.5 预览**（新会话默认模型 **DeepSeek-V41-Flash**，新增原生右侧栏 / 通用文件上传 / 动态系统提示词）。仓库里的 `package.json` 只记录你本机刚装上的版本，方便拥有者 git 提交；克隆用户仍自己查 npm。
-
-> 公式：`Model + Harness = Agent`。DSH 是 AI 智能体运行框架（对标 Claude Code / Codex），「一切皆插件」（模型 / 工具 / 预设 / 循环均可替换）。
+**官方桌面端为主，本仓库只保留两件事：`dsh-trivium` 记忆插件 + Windows 兜底启动脚本。**
 
 仓库：https://github.com/QWQcool/Dsh_BatStart
 
-## 前置要求
+> 2026-10 起定位变更：DeepSeek 官方已提供 Windows / macOS 桌面客户端（内置 Node / pnpm / Python 运行时，自带插件管理），
+> 原先「一键装引擎 + 起服务 + 开浏览器」的价值已被官方覆盖，本仓库不再重复实现。
+> 仅保留官方没有的部分：跨会话记忆插件 `dsh-trivium`，以及无桌面端环境（纯净机、远程、CI）用的 bat 兜底启动。
 
-1. **Node.js**（在 `PATH` 中）：https://nodejs.org
-2. 一个 **DeepSeek API Key**（https://platform.deepseek.com）→ 写入 `.env`
-3. （可选）**智谱 AI Key**（外部识图插件用，免费视觉模型 `glm-4.6v-flash`）：https://open.bigmodel.cn
+## 一、主路径：官方桌面端（推荐）
 
-## 快速开始
+1. 打开 https://www.deepseek.com/harness → **Download Desktop** → Windows (64-bit)
+   （直链：`https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe`）
+2. 安装并启动。桌面端会自带 `dsh` 运行时，**不需要另装 Node / pnpm**。
+3. 桌面端使用独立的 profile：`~/.dsh/profiles/desktop`，与 bat 用的 `web` profile 互不影响。
 
-1. 把 `.env.example` 复制为 `.env`，填入 Key：
-   - `DEEPSEEK_API_KEY=sk-xxxx`（必填）
-   - `ZHIPUAI_API_KEY=你的智谱Key`（选填，开启外部识图）
-2. 双击 `启动DSH网页版.bat`（或 ASCII 备用 `start-dsh-web.bat`）。
-3. 脚本依次：查 npm 引擎 `latest`（落后则清 `node_modules` 重装）→ 部署 `dsh-extra`（伴侣插件 + 预设 + 全局提示词 + 记忆插件 `dsh-trivium`）并打印已挂载插件 → 在 **3090** 起服务 → 打开 `http://127.0.0.1:3090`。
-4. 端口已被占用时会**杀掉旧进程再启动**（避免还在跑已删插件的旧服务）。关掉标题为 `DSH Web` 的窗口即停止服务。
+> ⚠️ 网上自称 "DSH Desktop" 的站点（dsharness.app、deepseekagent.io、各类 GitHub 壳）多为社区项目，
+> 有的还内置 `0.1.1-rc.2` 旧内核。**认官方只认 `deepseek.com/harness`。**
 
-> 新机器（git clone 后）首次双击会联网装引擎。可反复运行。
+已验证事实（0.2.1-rc.2）：
 
-## 模型与识图
+| 项目 | 结果 |
+|---|---|
+| 内嵌运行时 | Node 24.21.0 / pnpm 11.28.5 / Python 3.12.14 |
+| 默认 HTTP 端口 | 不占用（Electron 走 IPC），不会和 bat 的 3090 冲突 |
+| profile | `~/.dsh/profiles/desktop`，可编辑 `cordis.patch.yml` |
+| 本地路径插件 | 引擎侧支持（`dsh plugin add <目录>` → pnpm `link:`） |
+| profile 写入 | **CLI 拒绝**：`profile "desktop" is managed exclusively by the Electron application` |
 
-- **对话 / 编码**：设置 → Models 里选官方 DeepSeek 模型；只配 `DEEPSEEK_API_KEY` 即可聊。0.1.5 起新会话默认 **`DeepSeek-V41-Flash`**（id `deepseek-flash`）。
-- **原生多模态**：`DeepSeek-V41-Flash` 与 `DeepSeek-V4-Flash-Vision-Exp` 都收图，聊天里**粘贴 / 附件**图片直接进对话，走 DSH 原生多模态。
-- **外部识图插件**（可选）：设置里的 `view_image`，默认智谱 `glm-4.6v-flash`。给本地路径、URL、或纯文本模型看图用。
+因此桌面端的插件安装**只能走应用内插件页**（或等插件发布到 npm 后从插件页安装）。
 
-两条路**同时保留**，不会互相卸载。
+## 二、兜底路径：bat 启动（可选）
 
-## 0.1.5 有什么（相对 0.1.1）
+双击 `启动DSH网页版.bat`（或 ASCII 版 `start-dsh-web.bat`）：
 
-- **默认模型换成 `DeepSeek-V41-Flash`**（`deepseek-flash`，文本 + 图片，支持会话内改系统提示词），新会话直接用它。
-- **原生右侧栏**：多标签 / 分栏 / 全屏，预览 Markdown、代码高亮、HTML、PDF、图片；原 Detail 面板移除。
-- **通用文件上传**：任意类型文件与图片同区混排，支持进度 / 取消，模型可按保存路径读取。
-- 反馈可独立提交（`/feedback`）；顶栏「在应用中打开」；出站请求遵循 `HTTP_PROXY` / `HTTPS_PROXY` 等代理变量。
-- ⚠️ **破坏性变更**（本仓库已逐项改好）：会话格式升到 **V3**（只升不降，旧历史可能打不开）、插件 Agent API 去掉 `ctx.agent`、Web 插件面板 API 改为 `sidebar.panellist` / `main`、`dsh-system-prompt` 的 `persona` 拆成 `personaPrefix` / `personaSuffix`、`dsh-persona` 的 `text` 改名 `prefix`、极简模式默认只给持久 shell。
+1. 查 npm 的 `DSH_CHANNEL`（默认 **next**，与桌面端同一条线；可改 `latest` / `alpha`）
+2. 本机引擎落后则清 `node_modules` 重装
+3. 安装 `dsh-trivium` 到 `~/.dsh/profiles/web`（本机有 `Desktop/dsh-trivium` 源码时用 junction，改动即时生效）
+4. 在 **3090** 起服务并打开浏览器
 
-## dsh-extra：伴侣插件 / 预设 / 全局提示词
-
-`dsh-extra/` 把桌面版多出来的能力打进仓库，每次启动部署到本机 `~/.dsh`（插件目录会刷新，不是「有了就跳过」）。
-
-| 目录/文件 | 内容 | 部署到哪 |
-|---|---|---|
-| `dsh-extra/plugins/` | 插件市场、识图、文件改动追踪、余额、侧边栏增强等 | `~/.dsh/profiles/web/node_modules/` |
-| `dsh-extra/presets/` | 8 个扩展预设（含 Windows 极简 `minimal-win`、`router-standard` 等） | 引擎 `config/agent-presets/` |
-| `dsh-extra/sync-from-npm.cjs` | 每次启动跟 npm 升引擎 | — |
-| `dsh-extra/deploy-extra.cjs` | 部署伴侣内容 + 打印已挂载插件 | — |
-| **全局提示词** | **oh-we-need**（DeepSeek V4 思维链引导，`we need to ...`）写入 `system-prompt.personaPrefix` | 每次会话全局生效 |
-
-**clone 后双击 `.bat` = 完整版**，不用另装 DSH Desktop。伴侣插件已按 **0.1.5 网页客户端**适配（`dsh-persona` 用 `prefix`、`dsh-system-prompt` 用 `personaPrefix`、`dsh-prompt-custom` 兼容新旧 persona 节、侧边栏插件跟到 `0.19.0`），避免白屏 `Failed to load plugins`。
-
-### oh-we-need 全局提示词
-
-来源：[scp3500/oh-we-need](https://github.com/scp3500/oh-we-need)（MIT）。作为部署级 persona 注入：
-
-- 位置：`~/.dsh/profiles/web/cordis.patch.yml` → `system-prompt` 的 `config.personaPrefix`（0.1.1 时代叫 `config.persona`，脚本会自动迁移）
-- 范围：所有会话、所有预设（agent 级 persona 未设时用此默认）
-- 想改/关闭：改该文件，或改 `deploy-extra.cjs` 里的 `OH_WE_NEED_PERSONA` 后重新双击
-
-## 工作原理（简述）
-
-```
-node "<仓库>\node_modules\@deepseek-ai\dsh\lib\bin.js" web --port 3090
+```bat
+:: 需要跟 npm latest 时
+set DSH_CHANNEL=latest
+启动DSH网页版.bat
 ```
 
-引擎在本仓库 `node_modules`，伴侣插件和预设在 `dsh-extra`。跨会话记忆 [dsh-trivium](https://www.npmjs.com/package/dsh-trivium) 是另一个仓库，启动时按普通 DSH 插件装进本机 web profile。
+关掉标题为 `DSH Web` 的窗口即停止服务；3090 被占用会先杀旧进程再启动。
 
-## 预设
+## 三、`dsh-trivium`（唯一保留的插件）
 
-默认 `minimal-win`（Windows 极简：持久 PowerShell PTY + 编辑器）。Web UI 可切换 `standard`（标准模式）/ `ptc`（**PTC 模式**）/ `minimal`（极简模式）/ `cordis`（创造模式）/ `minimal-win` / `router-standard` 等共 12 个（4 个官方 + 8 个来自 `dsh-extra/presets`）。
+跨会话图记忆：每个工作区一份 `.dsh/trivium.tdb`，四工具 `ctx_find` / `ctx_read` / `ctx_remember` / `ctx_link`，
+会话起始注入 ≤400 token 短地图，设置页有「Trivium 记忆」，标题栏可开「芯片 / 会话层」。
 
-## 自带：跨会话记忆
+### 0.2.x 适配（本仓库源码 `Desktop/dsh-trivium` 已完成）
 
-启动时安装 [dsh-trivium](https://www.npmjs.com/package/dsh-trivium)（跟 npm latest，回退 **0.4.18**）。本机若有 `Desktop/dsh-trivium` 源码则 **junction** 过去，并把 `dsh-llm` / `dsh-tools` 接到宿主那一份，避免双份 instanceof 对不上。没有该文件夹的用户只走 npm。每个工作区一个 `.dsh/trivium.tdb`。设置里会出现「Trivium 记忆」，标题栏「对话 / 轨迹」旁会出现「会话图」（可手切「生成检查点」）。
+| 变更 | 说明 |
+|---|---|
+| 事件 `agent/session-start` → `agent/created` | DSH 0.1.6 起改名。插件现在同时监听两者（带去重集合），否则「待抽取重放 / sidecar 同步 / 情节层尾部」在 0.2.x 上完全不执行 |
+| 消息来源 `kind: "plugin"` → `kind: "plugin:dsh-trivium"` | **会话格式 v4 的核心破坏**：v4 不再有共享的 `plugin` kind，第三方生产者必须是 `plugin:<name>` 且删掉 `plugin` 字段。写旧形状会让整轮对话直接失败：`format v4 message requires a producer-owned source kind` |
+| peer 范围 `<0.2.0` → `<0.3.0` | 0.2.1 起插件兼容性先看 `engines.dsh`、无则看 peer；旧范围会被安装器和启动器判定为 `incompatible` 并拒载 |
+| `webServer` / 工具 / `session/event` / `pre-step` | 0.2.1 上实测不变，路由与客户端注入均正常 |
 
-识图、侧边栏是可选的；记忆插件会默认装上。
+适配版本 **`dsh-trivium@0.4.21` 已发布到 npm**，兼容 0.2.x；0.4.20 及更早只支持 `<0.2.0`。
 
-## 可选插件
+实测（0.2.1-rc.2，真实模型调用）：`ctx_remember` 写入成功、会话起始短地图注入 105 tokens、
+`compaction/idle` 抽取流水线正常、新会话可跨会话召回。
 
-设置里可按需打开：插件市场、识图（外部 `view_image`）、文件改动追踪、余额、侧边栏增强。
+### 桌面端怎么装这个插件
 
-## 故障排查
+1. 应用内 **插件** 页 → **添加插件**，输入 `dsh-trivium@0.4.21`，或直接填本地源码目录
+   （`C:\Users\<你>\Desktop\dsh-trivium`，界面明确支持本地目录路径）。
+2. **关键一步**：桌面端安装只把包写进 `~/.dsh/profiles/desktop/package.json` 的 `dependencies`，
+   **不会加进 `dsh.profile.bundles`**，所以重开应用后插件不会挂载（设置里看不到「Trivium 记忆」）。
+   需要在该文件的 `dsh.profile.bundles` 数组里补一行 `"dsh-trivium"`：
 
-- 默认端口 3090；被占用会先杀再启。可改 `.bat` 里的 `--port`。
-- 浏览器没自动开：手动访问 `http://127.0.0.1:3090`。
-- 报「未找到 node」：安装 Node.js 并确保在 `PATH`。
-- 报「引擎安装失败」：检查网络。跟的是 npmjs 上的 `@deepseek-ai/dsh` / `dsh-trivium` `latest`。升级引擎会清掉 `node_modules` 再装（原地 upgrade 会卡住）。
-- **白屏 Failed to load plugins**：先 **Ctrl+F5** 强刷，避免缓存旧 `client.js`。本仓库伴侣插件已适配 0.1.5；侧边栏插件（`dsh-better-sidebar`）需要宿主提供 `dsh-client-ui-slots` / `dsh-client-ui-primitives`，0.1.5 引擎不再随包带、离线副本也补不了这个 peer——要用请走官方 `dsh plugin --profile web add dsh-better-sidebar@latest`（会顺带装 peer），不挡主界面。
-- **升级预览版**：rc.8 起官方 SQLite 会话格式不兼容旧版；**0.1.5 起会话格式升到 V3（只升不降）**，升引擎后旧历史可能打不开，当新任务即可。
-- **升级后全局提示词失效 / 预设报错**：0.1.5 把 `system-prompt` 的 `persona` 拆成 `personaPrefix` / `personaSuffix`，预设的 `dsh-persona` 也从 `text` 改名 `prefix`。本仓库已改好；若你手改过 `~/.dsh/profiles/web/cordis.patch.yml`，重新双击一次 `.bat` 会自动把旧 `persona` 就地迁成 `personaPrefix`。
-- 全局提示词没生效：确认 `.bat` 跑过 `deploy-extra.cjs`；检查 `~/.dsh/profiles/web/cordis.patch.yml` 是否含 `system-prompt`。
-- `Cannot find package '@deepseek-ai/dsh-llm'`（来自 `Desktop/dsh-trivium`）：本地源码不要自己 `npm install` peer。再跑一次启动脚本，会把宿主里的 `dsh-llm` / `dsh-tools` junction 过去。
+   ```json
+   "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-trivium"]
+   ```
+3. 重启应用 → 设置左侧应出现 **Trivium 记忆**。该 `bundles` 条目在应用重启后保留。
+
+> 桌面 profile 由 Electron 独占，CLI 会报 `profile "desktop" is managed exclusively by the Electron application`，
+> 所以第 2 步只能手改文件，不能用 `dsh plugin` 命令。
+>
+> 需要绕过兼容性闸门时，官方给了显式豁免：
+> `dsh plugin --profile <profile> allow-version <pkg@ver> --dsh-version <ver> --accept-risk`
+
+## 四、已移除的内容（迁移说明）
+
+以下内容曾由本仓库离线分发，现已删除（官方已覆盖或与 0.2.x 不兼容）：
+
+| 移除项 | 原因 |
+|---|---|
+| `dsh-extra/plugins/`（插件市场、识图、改动追踪、余额、侧边栏增强等 7 个） | 官方插件页 + 索引源「发现」页已覆盖；`zat-dsh-engine` 与官方插件市场重复 |
+| `dsh-extra/presets/`（8 个扩展预设） | 官方 Agent Preset 体系已成熟；`minimal-win` 等为旧版补丁 |
+| oh-we-need 全局 persona | 个人偏好，不再随仓库注入（`~/.dsh/profiles/web/cordis.patch.yml` 中的旧条目已清除） |
+| `deploy-extra.cjs` | 由 `install-trivium.cjs` 取代 |
+
+## 五、故障排查
+
+| 现象 | 处理 |
+|---|---|
+| 桌面端装了插件但没生效 | 先查 `~/.dsh/profiles/desktop/package.json` 的 `dsh.profile.bundles` 是否含该包；只进 `dependencies` 不会挂载（见「桌面端怎么装这个插件」第 2 步） |
+| 对话报 `format v4 message requires a producer-owned source kind` | 插件还在用旧的 `kind: "plugin"` 来源。升级到 `dsh-trivium@0.4.21+` |
+| `installation rejected: ... incompatible with dsh` | 插件 peer 范围没覆盖当前引擎。用已适配版，或按提示 `allow-version ... --accept-risk` 显式承担风险 |
+| 白屏 / `Failed to load plugins` | Ctrl+F5 强刷；确认没有残留旧插件（`~/.dsh/profiles/<profile>/node_modules` 应只剩需要的包） |
+| 升级后旧会话打不开 | 0.1.5 起会话格式 V3 只升不降，当新任务即可 |
+| 报「未找到 node」 | 只影响 bat 兜底路径：安装 Node.js 或放到 `%USERPROFILE%\.workbuddy\binaries\node\versions\*\node.exe` |
+| bat 引擎安装失败 | 检查网络；脚本按 `DSH_CHANNEL` 查 npmjs，镜像未同步时回退官方源 |
 
 ## License
 
