@@ -91,16 +91,25 @@ set "SERVER_LOG=%SCRIPT_DIR%\dsh-server.log"
 if exist "%SERVER_LOG%" del "%SERVER_LOG%"
 start "DSH Web" cmd /c ""%NODE_EXE%" "%DSH_BIN%" web --no-open --port %PORT% > "%SERVER_LOG%" 2>&1"
 
-:: 6) wait, then self-check the port and open browser
+:: 6) wait for the tokenised login URL, then open it
+::    DSH 0.2.x refuses a bare http://127.0.0.1:PORT/ with
+::    "dsh web authentication required"; the browser must land on the
+::    ?token=... link the server prints (it is a single-use token).
 echo [Dsh_BatStart] waiting for server to start
-ping -n 7 127.0.0.1 >nul
-set "UP="
-netstat -ano 2>nul | findstr ":3090" >nul && set "UP=1"
-if not defined UP (
-  ping -n 4 127.0.0.1 >nul
-  netstat -ano 2>nul | findstr ":3090" >nul && set "UP=1"
+set "LOGIN_URL="
+for /l %%i in (1,1,40) do (
+  if not defined LOGIN_URL (
+    for /f "tokens=3 delims= " %%u in ('findstr /c:"dsh web: http://" "%SERVER_LOG%" 2^>nul') do set "LOGIN_URL=%%u"
+    if not defined LOGIN_URL ping -n 2 127.0.0.1 >nul
+  )
 )
-start "" "http://127.0.0.1:%PORT%"
+set "UP="
+netstat -ano 2>nul | findstr ":%PORT%" >nul && set "UP=1"
+if defined LOGIN_URL (
+  start "" "%LOGIN_URL%"
+) else (
+  start "" "http://127.0.0.1:%PORT%"
+)
 echo.
 echo [Dsh_BatStart] ============================================
 if defined UP (
@@ -109,6 +118,14 @@ if defined UP (
   echo  WARNING: port %PORT% is NOT listening yet.
   echo  The server window may have failed to start.
   echo  Check dsh-server.log in this folder and send its content for help.
+)
+if defined LOGIN_URL (
+  echo  Login URL ^(token is single-use, keep this window open^):
+  echo    %LOGIN_URL%
+) else (
+  echo  WARNING: could not read the login URL from dsh-server.log.
+  echo  If the browser says "authentication required", copy the
+  echo  "dsh web: http://..." line from dsh-server.log into the browser.
 )
 echo  The server window title is DSH Web. Close it to stop the service.
 echo [Dsh_BatStart] ============================================

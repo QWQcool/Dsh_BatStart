@@ -106,6 +106,7 @@ dsh_web.bat
 | 桌面端装了插件但没生效 | 先查 `~/.dsh/profiles/desktop/package.json` 的 `dsh.profile.bundles` 是否含该包；只进 `dependencies` 不会挂载（见「桌面端怎么装这个插件」第 2 步） |
 | 对话报 `format v4 message requires a producer-owned source kind` | 插件还在用旧的 `kind: "plugin"` 来源。升级到 `dsh-trivium@0.4.21+` |
 | `installation rejected: ... incompatible with dsh` | 插件 peer 范围没覆盖当前引擎。用已适配版，或按提示 `allow-version ... --accept-risk` 显式承担风险 |
+| 浏览器显示 `dsh web authentication required` | 必须用带 `?token=` 的链接打开（`dsh-server.log` 里的 `dsh web: http://...` 那一行，token 一次性）。`dsh_web.bat` 已自动读取并打开；手动敲裸地址必然 401 |
 | 白屏 / `Failed to load plugins` | Ctrl+F5 强刷；确认没有残留旧插件（`~/.dsh/profiles/<profile>/node_modules` 应只剩需要的包） |
 | 升级后旧会话打不开 | 0.1.5 起会话格式 V3 只升不降，当新任务即可 |
 | 报「未找到 node」 | 只影响 bat 兜底路径：安装 Node.js 或放到 `%USERPROFILE%\.workbuddy\binaries\node\versions\*\node.exe` |
