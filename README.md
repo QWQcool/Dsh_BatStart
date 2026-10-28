@@ -18,7 +18,7 @@
 > ⚠️ 网上自称 "DSH Desktop" 的站点（dsharness.app、deepseekagent.io、各类 GitHub 壳）多为社区项目，
 > 有的还内置 `0.1.1-rc.2` 旧内核。**认官方只认 `deepseek.com/harness`。**
 
-已验证事实（0.2.1-rc.2）：
+已验证事实（0.2.1-rc.3）：
 
 | 项目 | 结果 |
 |---|---|
@@ -29,6 +29,21 @@
 | profile 写入 | **CLI 拒绝**：`profile "desktop" is managed exclusively by the Electron application` |
 
 因此桌面端的插件安装**只能走应用内插件页**（或等插件发布到 npm 后从插件页安装）。
+
+### 版本对齐（2026-10-28）
+
+| 组件 | 版本 | 来源 |
+|---|---|---|
+| 官方桌面端 | **0.2.1-rc.3** | `download.deepseek.com/dsh-desk/feeds/win-x64/nightly.yml`（`channel: nightly`） |
+| 桌面端内嵌引擎 | 0.2.1-rc.3 | 随安装包 |
+| 兜底 bat 引擎 | **0.2.1-rc.4** | npm `next`（`DSH_CHANNEL=next`） |
+| npm `latest` | 0.2.1-rc.2 | 稳定线，落后于桌面端 |
+
+两者同属 `0.2.1` 线；**桌面 feed 比 npm `next` 慢一个补丁**，所以 bat 会略微超前，属预期。
+升级桌面端时用应用内更新，或直接装 feed 里的 `deepseek-harness-<ver>-win-x64.exe`。
+
+> ⚠️ 桌面端和 bat 共用 `~/.dsh`。**同一个工作区的 `.dsh/trivium.tdb` 不能被两个进程同时打开**，
+> 否则记忆工具会报「数据库已锁定」。二选一：要么用桌面端，要么用 bat，别同时开同一个项目。
 
 ## 二、兜底路径：bat 启动（可选）
 
