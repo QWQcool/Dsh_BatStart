@@ -70,7 +70,7 @@ if exist "%SCRIPT_DIR%\.env" (
 ::    Override with: set DSH_CHANNEL=latest   (or alpha)
 if not defined DSH_CHANNEL set "DSH_CHANNEL=next"
 if exist "%SCRIPT_DIR%\dsh-extra\sync-from-npm.cjs" (
-  echo [Dsh_BatStart] checking npm (%DSH_CHANNEL%) for @deepseek-ai/dsh updates
+  echo [Dsh_BatStart] checking npm channel %DSH_CHANNEL% for @deepseek-ai/dsh updates
   "%NODE_EXE%" "%SCRIPT_DIR%\dsh-extra\sync-from-npm.cjs"
 )
 if not exist "%DSH_BIN%" (

@@ -32,7 +32,7 @@
 
 ## 二、兜底路径：bat 启动（可选）
 
-双击 **`启动DSH网页版.bat`**：
+双击 **`dsh_web.bat`**：
 
 1. 查 npm 的 `DSH_CHANNEL`（默认 **next**，与桌面端同一条线；可改 `latest` / `alpha`）
 2. 本机引擎落后则清 `node_modules` 重装，随后把 `package.json` 的依赖版本回写成实际安装版
@@ -40,15 +40,15 @@
 4. 在 **3090** 起服务并打开浏览器
 
 ```bat
-:: 需要跟 npm latest（当前 0.2.1-rc.2，比 next 旧）时
+:: 需要跟 npm latest（当前 0.2.1-rc.2，比 next 的 0.2.1-rc.4 旧）时
 set DSH_CHANNEL=latest
-启动DSH网页版.bat
+dsh_web.bat
 ```
 
 关掉标题为 `DSH Web` 的窗口即停止服务；3090 被占用会先杀旧进程再启动。
 
 > 早期仓库同时提供中文名与 ASCII 名（`start-dsh-web.bat`）两份内容完全相同的脚本，
-> 2026-10 起合并为单个 `启动DSH网页版.bat`，避免双份手工同步漂移。
+> 2026-10 起合并为单个；2026-10-28 更名为 **`dsh_web.bat`**（纯 ASCII，避免中文文件名在部分终端 / CI 下乱码）。
 
 ## 三、`dsh-trivium`（唯一保留的插件）
 

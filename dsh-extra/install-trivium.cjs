@@ -31,7 +31,7 @@ const { viewVersion, viewVersionFrom, registryUrl, npmInstall } = require("./npm
 const TRIVIUM_PKG = "dsh-trivium";
 // First release that speaks session format v4 (producer-owned message sources)
 // and listens to agent/created; older builds break every turn on 0.2.x.
-const TRIVIUM_FALLBACK = "0.4.21";
+const TRIVIUM_FALLBACK = "0.4.22";
 
 const PATCH_HEAD = `# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; \`!!js\` expressions allowed).\n`;
 
