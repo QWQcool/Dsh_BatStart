@@ -4,6 +4,6 @@
   "description": "Fallback DeepSeek Harness web launcher (Windows) plus the dsh-trivium memory plugin. The official desktop client is the primary path.",
   "license": "MIT",
   "dependencies": {
-    "@deepseek-ai/dsh": "0.2.1-rc.4"
+    "@deepseek-ai/dsh": "0.2.1-rc.5"
   }
 }

@@ -30,16 +30,17 @@
 
 因此桌面端的插件安装**只能走应用内插件页**（或等插件发布到 npm 后从插件页安装）。
 
-### 版本对齐（2026-10-28）
+### 版本对齐（2026-10-30）
 
 | 组件 | 版本 | 来源 |
 |---|---|---|
 | 官方桌面端 | **0.2.1-rc.3** | `download.deepseek.com/dsh-desk/feeds/win-x64/nightly.yml`（`channel: nightly`） |
 | 桌面端内嵌引擎 | 0.2.1-rc.3 | 随安装包 |
-| 兜底 bat 引擎 | **0.2.1-rc.4** | npm `next`（`DSH_CHANNEL=next`） |
-| npm `latest` | 0.2.1-rc.2 | 稳定线，落后于桌面端 |
+| 兜底 bat 引擎 | **0.2.1-rc.5** | npm `next`（`DSH_CHANNEL=next`） |
+| npm `latest` | 0.2.1-rc.5 | 已与 `next` 同步 |
+| `dsh-trivium` | **0.8.1** | npm latest；依赖 `triviumdb@0.9.0-beta.3` |
 
-两者同属 `0.2.1` 线；**桌面 feed 比 npm `next` 慢一个补丁**，所以 bat 会略微超前，属预期。
+两者同属 `0.2.1` 线；**桌面 feed 比 npm 慢一个补丁**，所以 bat 会略微超前，属预期。
 升级桌面端时用应用内更新，或直接装 feed 里的 `deepseek-harness-<ver>-win-x64.exe`。
 
 > ⚠️ 桌面端和 bat 共用 `~/.dsh`。**同一个工作区的 `.dsh/trivium.tdb` 不能被两个进程同时打开**，
